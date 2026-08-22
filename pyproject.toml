@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-polymarket-bot"
+version = "0.1.0"
+description = "A risk-managed automated trading bot that uses Claude to analyze and trade Polymarket prediction markets."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "anthropic>=0.68.0",
+    "py-clob-client>=0.24.0",
+    "web3>=6.15.0",
+    "requests>=2.31.0",
+    "pydantic>=2.6.0",
+    "python-dotenv>=1.0.1",
+    "PyYAML>=6.0.1",
+    "click>=8.1.7",
+    "rich>=13.7.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0.0", "pytest-mock>=3.14.0"]
+
+[project.scripts]
+polybot = "polybot.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["polybot*"]

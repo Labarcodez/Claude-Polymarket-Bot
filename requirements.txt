@@ -1,0 +1,13 @@
+anthropic>=0.68.0
+py-clob-client>=0.24.0
+web3>=6.15.0
+requests>=2.31.0
+pydantic>=2.6.0
+python-dotenv>=1.0.1
+PyYAML>=6.0.1
+click>=8.1.7
+rich>=13.7.1
+
+# dev / test
+pytest>=8.0.0
+pytest-mock>=3.14.0

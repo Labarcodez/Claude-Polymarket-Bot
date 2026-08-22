@@ -1,0 +1,84 @@
+# Claude-Polymarket-Bot configuration
+#
+# Secrets (ANTHROPIC_API_KEY, POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER_ADDRESS)
+# live in .env / the environment, never in this file.
+#
+# Every number in here is a starting point, not a recommendation. Trading
+# involves risk of loss. Read docs/RISK_DISCLAIMER.md before changing `mode`
+# to "live".
+
+# dry_run: paper trading only. Orders are simulated, positions are tracked
+#          in the local database, nothing ever touches your wallet.
+# live:    real orders, real money. Also requires POLYBOT_CONFIRM_LIVE=yes
+#          in the environment -- see .env.example.
+mode: dry_run
+
+# How often (seconds) the `polybot run` loop scans markets and reviews
+# open positions.
+polling_interval_seconds: 300
+
+polymarket:
+  clob_host: "https://clob.polymarket.com"
+  gamma_host: "https://gamma-api.polymarket.com"
+  data_host: "https://data-api.polymarket.com"
+  chain_id: 137
+  # 0 = EOA (MetaMask-style) wallet, 1 = Polymarket email/Magic wallet,
+  # 2 = Gnosis Safe / proxy wallet. Must match how POLYMARKET_FUNDER_ADDRESS
+  # was created. See README "Wallet setup".
+  signature_type: 0
+
+# Which markets are even considered as candidates each cycle.
+market_scan:
+  max_markets_per_cycle: 20          # how many candidates get sent to Claude per cycle
+  fetch_pool_size: 150                # how many markets to pull from Gamma before filtering
+  min_volume_24hr: 5000               # USD
+  min_liquidity: 2000                 # USD
+  min_days_to_resolution: 0.25        # skip markets resolving in <6h (execution/settlement risk)
+  max_days_to_resolution: 45          # skip markets that won't resolve for a very long time
+  min_price: 0.03                     # skip near-zero-probability outcomes (bad risk/reward, thin book)
+  max_price: 0.97                     # skip near-certain outcomes (little edge left)
+  max_spread: 0.08                    # skip markets with a wide bid/ask (expensive to trade)
+  include_tags: []                    # e.g. ["Politics", "Crypto"] -- empty = no restriction
+  exclude_tags: []                    # e.g. ["Sports"]
+
+# How Claude is used to analyze each candidate market.
+ai:
+  model: "claude-opus-5"
+  # low | medium | high | xhigh | max -- higher = better analysis, more $ and latency
+  effort: "medium"
+  max_tokens: 4000
+  # Decisions below this confidence are discarded before risk sizing ever runs.
+  min_confidence: 0.65
+  # Required |model probability - market price| before a trade is even considered.
+  # This is the bot's estimate of its own edge -- it does not guarantee the
+  # edge is real.
+  min_edge: 0.05
+
+# Position sizing and loss limits. This is what actually keeps the bot from
+# blowing up your bankroll on a bad or overconfident model call -- take it
+# seriously.
+risk:
+  # 0 = auto-detect from your live USDC balance when trading is enabled.
+  # Set a fixed number to cap the bot's notion of "bankroll" below your
+  # actual wallet balance (recommended while testing).
+  bankroll_usd: 0
+  max_position_usd: 25                # hard ceiling per single order
+  max_exposure_per_market_pct: 0.10   # of bankroll, across all open positions in one market
+  max_total_exposure_pct: 0.50        # of bankroll, across all open positions combined
+  max_open_positions: 15
+  max_daily_loss_usd: 50              # trading halts (new entries only) for the day past this
+  max_daily_trades: 20
+  # Fraction of full Kelly to actually stake. Full Kelly is aggressive and
+  # assumes your probability estimate is exactly right, which it won't be --
+  # 0.25 (quarter-Kelly) is a common conservative default.
+  kelly_fraction: 0.25
+  min_order_usd: 1
+  slippage_bps: 100                   # limit-price buffer added when crossing the spread
+  take_profit_pct: 0.35               # close a position once unrealized gain >= this, vs. cost
+  stop_loss_pct: 0.35                 # close a position once unrealized loss >= this, vs. cost
+  exit_before_resolution_hours: 2     # force-close positions this close to market resolution
+
+logging:
+  level: "INFO"
+  db_path: "data/polybot.db"
+  log_path: "data/polybot.log"

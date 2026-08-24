@@ -30,12 +30,42 @@ def test_record_decision_and_order(tmp_path):
     db = make_db(tmp_path)
     decision = TradeDecision(
         action=Action.BUY_YES, fair_value_probability=0.6, confidence=0.8,
-        suggested_size_usd=10, time_horizon_days=3, reasoning="x", risk_flags=[], key_uncertainties=[],
+        suggested_size_usd=10, time_horizon_days=3, reasoning="x", risk_flags=["thin_liquidity"], key_uncertainties=[],
     )
-    db.record_decision("0xcond", "slug", decision, market_price=0.5, executed=True)
+    db.record_decision("0xcond", "slug", decision, market_price=0.5, executed=True, question="Will X happen?")
     plan = make_plan()
     db.record_order(plan, status="simulated", order_id=None, dry_run=True)
-    # No exception = success; nothing else externally observable from these tables via the public API.
+
+    [row] = db.get_recent_decisions()
+    assert row["condition_id"] == "0xcond"
+    assert row["slug"] == "slug"
+    assert row["question"] == "Will X happen?"  # regression check: this used to always be recorded as NULL
+    assert row["action"] == "BUY_YES"
+    assert row["fair_value_probability"] == 0.6
+    assert row["confidence"] == 0.8
+    assert row["market_price"] == 0.5
+    assert row["executed"] == 1
+    assert row["venue"] == "polymarket"
+    assert "thin_liquidity" in row["risk_flags"]
+
+
+def test_get_recent_decisions_filters_by_venue_and_orders_newest_first(tmp_path):
+    db = make_db(tmp_path)
+    decision = TradeDecision(
+        action=Action.NO_TRADE, fair_value_probability=0.5, confidence=0.5,
+        suggested_size_usd=0, time_horizon_days=0, reasoning="x", risk_flags=[], key_uncertainties=[],
+    )
+    db.record_decision("0xa", "a", decision, market_price=0.5, executed=False, venue="polymarket", question="A?")
+    db.record_decision("KXB", "KXB", decision, market_price=0.5, executed=False, venue="kalshi", question="B?")
+    db.record_decision("0xc", "c", decision, market_price=0.5, executed=False, venue="polymarket", question="C?")
+
+    poly = db.get_recent_decisions(venue="polymarket")
+    assert [r["question"] for r in poly] == ["C?", "A?"]  # newest first
+
+    kalshi = db.get_recent_decisions(venue="kalshi")
+    assert [r["question"] for r in kalshi] == ["B?"]
+
+    assert len(db.get_recent_decisions()) == 3
 
 
 def test_open_and_close_position_tracks_pnl(tmp_path):

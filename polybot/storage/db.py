@@ -145,7 +145,7 @@ class Database:
 
     def record_decision(
         self, condition_id: str, slug: str, decision: TradeDecision, market_price: float,
-        executed: bool, venue: str = "polymarket",
+        executed: bool, venue: str = "polymarket", question: str = "",
     ) -> None:
         with self._connect() as conn:
             conn.execute(
@@ -154,11 +154,24 @@ class Database:
                     confidence, market_price, reasoning, risk_flags, executed)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    _now_iso(), venue, condition_id, slug, None, decision.action.value,
+                    _now_iso(), venue, condition_id, slug, question, decision.action.value,
                     decision.fair_value_probability, decision.confidence, market_price,
                     decision.reasoning, json.dumps(decision.risk_flags), int(executed),
                 ),
             )
+
+    def get_recent_decisions(self, venue: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        """Most recent decisions first, for `polybot decisions` -- the
+        auditable record of what Claude actually said about each market,
+        whether or not the risk manager acted on it."""
+        with self._connect() as conn:
+            if venue:
+                rows = conn.execute(
+                    "SELECT * FROM decisions WHERE venue = ? ORDER BY id DESC LIMIT ?", (venue, limit)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
 
     # ---- orders & positions -------------------------------------------------
 

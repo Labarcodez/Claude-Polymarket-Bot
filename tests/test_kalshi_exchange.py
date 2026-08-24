@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import base64
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
 
 import pytest
 
-from polybot.exchanges.kalshi import API_PREFIX, KalshiHttpClient, _to_cents, parse_market
+from polybot.exchanges.base import LivePosition
+from polybot.exchanges.kalshi import API_PREFIX, KalshiExchange, KalshiHttpClient, _to_cents, parse_market
 
 
 def raw_market(**overrides):
@@ -129,3 +131,75 @@ def test_auth_headers_signature_verifies_against_public_key(rsa_keypair):
             padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=hashes.SHA256().digest_size),
             hashes.SHA256(),
         )
+
+
+# ---- fill-count reconciliation ---------------------------------------------
+# Field names (taker_fill_count / maker_fill_count, nested under "order")
+# confirmed against Kalshi's own swagger-generated Python SDK model docs
+# (github.com/lowgrind/kalshi-python) -- see the module docstring in kalshi.py.
+
+
+def test_reconcile_fill_reads_taker_fill_count():
+    resp = {"order": {"order_id": "abc123", "status": "executed", "taker_fill_count": 5, "maker_fill_count": 0}}
+    result = KalshiExchange._reconcile_fill(resp, requested_count=5, requested_price=0.42)
+    assert result.success is True
+    assert result.filled_shares == 5.0
+    assert result.fill_price == 0.42
+    assert result.order_id == "abc123"
+    assert result.status == "executed"
+
+
+def test_reconcile_fill_sums_taker_and_maker():
+    resp = {"order": {"order_id": "abc123", "status": "executed", "taker_fill_count": 3, "maker_fill_count": 2}}
+    result = KalshiExchange._reconcile_fill(resp, requested_count=5, requested_price=0.42)
+    assert result.filled_shares == 5.0
+
+
+def test_reconcile_fill_zero_fill_is_not_success():
+    resp = {"order": {"order_id": "abc123", "status": "canceled", "taker_fill_count": 0, "maker_fill_count": 0}}
+    result = KalshiExchange._reconcile_fill(resp, requested_count=5, requested_price=0.42)
+    assert result.success is False
+    assert result.status == "canceled"
+
+
+def test_reconcile_fill_falls_back_to_requested_count_on_unknown_shape():
+    resp = {"order": {"order_id": "abc123", "status": "executed"}}  # neither fill-count field present
+    result = KalshiExchange._reconcile_fill(resp, requested_count=7, requested_price=0.5)
+    assert result.success is True
+    assert result.filled_shares == 7.0  # optimistic fallback, not silently dropped
+
+
+# ---- reconciliation (get_live_positions) -----------------------------------
+
+
+def _bare_kalshi_exchange() -> KalshiExchange:
+    """Construct a KalshiExchange without going through __init__ (which
+    needs a full AppConfig) -- just enough to exercise get_live_positions."""
+    exchange = KalshiExchange.__new__(KalshiExchange)
+    exchange.http = MagicMock()
+    exchange.http.can_sign = True
+    return exchange
+
+
+def test_get_live_positions_parses_signed_position_field():
+    exchange = _bare_kalshi_exchange()
+    exchange.http.get.return_value = {
+        "market_positions": [
+            {"ticker": "KXYES-24", "position": 12},   # net long YES
+            {"ticker": "KXNO-24", "position": -8},     # net long NO
+            {"ticker": "KXFLAT-24", "position": 0},    # flat -- should be skipped
+        ]
+    }
+    positions = exchange.get_live_positions()
+    by_ticker = {p.condition_id: p for p in positions}
+
+    assert by_ticker["KXYES-24"] == LivePosition(condition_id="KXYES-24", outcome="YES", shares=12.0, question="KXYES-24")
+    assert by_ticker["KXNO-24"].outcome == "NO"
+    assert by_ticker["KXNO-24"].shares == 8.0
+    assert "KXFLAT-24" not in by_ticker
+
+
+def test_get_live_positions_returns_none_on_failure():
+    exchange = _bare_kalshi_exchange()
+    exchange.http.get.side_effect = RuntimeError("network error")
+    assert exchange.get_live_positions() is None

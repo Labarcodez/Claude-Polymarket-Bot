@@ -16,10 +16,11 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from ..clob.client import PolyTradingClient
+from ..clob.data_api import DataApiClient
 from ..clob.gamma import GammaClient
 from ..config import AppConfig
 from ..engine.models import MarketSnapshot, OpenPosition, OrderPlan
-from .base import ExchangeAdapter, ExecutionResult
+from .base import ExchangeAdapter, ExecutionResult, LivePosition
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,7 @@ class PolymarketExchange(ExchangeAdapter):
 
     def __init__(self, config: AppConfig):
         self.gamma = GammaClient(config.polymarket.gamma_host)
+        self.data_api = DataApiClient(config.polymarket.data_host)
         self.clob = PolyTradingClient(
             host=config.polymarket.clob_host,
             chain_id=config.polymarket.chain_id,
@@ -124,6 +126,10 @@ class PolymarketExchange(ExchangeAdapter):
             funder_address=config.funder_address,
             signature_type=config.polymarket.signature_type,
         )
+        # The address that actually *holds* positions -- the funder/proxy
+        # address for email/Magic or Safe wallets, or just the signer's own
+        # address for a plain EOA.
+        self._funder_address = config.funder_address
 
     @property
     def read_only(self) -> bool:
@@ -203,3 +209,37 @@ class PolymarketExchange(ExchangeAdapter):
             success=True, filled_shares=position.shares, fill_price=price_hint,
             order_id=order_id, status="filled", raw=resp,
         )
+
+    # ---- reconciliation ---------------------------------------------------
+
+    def get_live_positions(self) -> Optional[List[LivePosition]]:
+        self.require_trading()
+        address = self._funder_address or self.clob.client.get_address()
+        if not address:
+            logger.warning("Could not determine a wallet address to fetch live positions for")
+            return None
+
+        try:
+            # sizeThreshold=0 so a small position (this bot can size well
+            # under the Data API's default 1.0-share threshold) isn't
+            # silently hidden from reconciliation.
+            raw = self.data_api.get_positions(user=address, sizeThreshold=0)
+        except Exception:
+            logger.exception("Failed to fetch live Polymarket positions for %s", address)
+            return None
+
+        positions = []
+        for p in raw:
+            condition_id = p.get("conditionId")
+            size = p.get("size")
+            if condition_id is None or size is None:
+                continue
+            positions.append(
+                LivePosition(
+                    condition_id=condition_id,
+                    outcome=str(p.get("outcome") or "").upper(),
+                    shares=float(size),
+                    question=p.get("title") or condition_id,
+                )
+            )
+        return positions

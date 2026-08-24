@@ -80,7 +80,7 @@ class TradingEngine:
             plan = self.risk_manager.plan_entry_order(decision, market, portfolio)
             self.db.record_decision(
                 market.condition_id, market.slug, decision, market_price, executed=plan is not None,
-                venue=market.venue,
+                venue=market.venue, question=market.question,
             )
 
             if plan is None:

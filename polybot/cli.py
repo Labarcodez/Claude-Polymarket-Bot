@@ -234,6 +234,103 @@ def positions(ctx: click.Context) -> None:
 
 
 @main.command()
+@click.option("--limit", default=20, show_default=True, help="How many recent decisions to show.")
+@click.pass_context
+def decisions(ctx: click.Context, limit: int) -> None:
+    """Show Claude's most recent analyses -- the auditable record of what
+    it actually said about each market, whether or not the risk manager
+    acted on it. Most recent first."""
+    from .storage.db import Database
+
+    cfg = _load_from_ctx(ctx)
+    db = Database(cfg.logging.db_path)
+    rows = db.get_recent_decisions(venue=cfg.exchange, limit=limit)
+
+    if not rows:
+        console.print(f"No recorded decisions yet for {cfg.exchange}. Run `polybot run` or `polybot scan` first.")
+        return
+
+    table = Table(title=f"Recent Claude decisions on {cfg.exchange}")
+    for col in ("Time", "Market", "Action", "P(YES)", "Conf.", "Traded?", "Reasoning"):
+        table.add_column(col, overflow="fold")
+
+    for r in rows:
+        market_label = (r["question"] or r["slug"] or r["condition_id"])[:50]
+        table.add_row(
+            r["ts"].split("T")[0] + " " + r["ts"].split("T")[1][:8],
+            market_label,
+            r["action"],
+            f"{r['fair_value_probability']:.2f}",
+            f"{r['confidence']:.2f}",
+            "yes" if r["executed"] else "-",
+            (r["reasoning"] or "")[:100],
+        )
+    console.print(table)
+
+
+@main.command()
+@click.pass_context
+def reconcile(ctx: click.Context) -> None:
+    """Compare the local ledger's open positions against the venue's own
+    records and report any drift. Requires trading credentials (it's a
+    live-account check, not a dry_run simulation) but never places an
+    order. Useful after going live, especially early on -- see the
+    Kalshi-specific caveat in docs/RISK_DISCLAIMER.md about unverified
+    fill-count reconciliation."""
+    from .exchanges import build_exchange
+    from .storage.db import Database
+
+    cfg = _load_from_ctx(ctx)
+    db = Database(cfg.logging.db_path)
+    exchange = build_exchange(cfg)
+
+    if exchange.read_only:
+        console.print(f"[red]No trading credentials set for {cfg.exchange} -- nothing to reconcile against.[/red]")
+        raise SystemExit(1)
+
+    live = exchange.get_live_positions()
+    if live is None:
+        console.print(f"[red]Could not fetch live {cfg.exchange} positions (unsupported, or the request failed -- check the logs above).[/red]")
+        raise SystemExit(1)
+
+    local = {p.condition_id: p for p in db.get_open_positions(venue=cfg.exchange)}
+    live_by_id = {lp.condition_id: lp for lp in live}
+
+    table = Table(title=f"Reconciliation: local ledger vs. live {cfg.exchange} account")
+    for col in ("Market", "Local shares", "Live shares", "Diff", ""):
+        table.add_column(col)
+
+    mismatches = 0
+    for condition_id in sorted(set(local) | set(live_by_id)):
+        lp, rp = local.get(condition_id), live_by_id.get(condition_id)
+        local_shares = lp.shares if lp else 0.0
+        live_shares = rp.shares if rp else 0.0
+        diff = live_shares - local_shares
+        ok = abs(diff) < 0.01
+        if not ok:
+            mismatches += 1
+        question = (lp.question if lp else rp.question if rp else condition_id)[:55]
+        table.add_row(
+            question, f"{local_shares:.2f}", f"{live_shares:.2f}", f"{diff:+.2f}",
+            "[green]OK[/green]" if ok else "[bold red]MISMATCH[/bold red]",
+        )
+
+    if not local and not live_by_id:
+        console.print(f"No open positions locally or on {cfg.exchange}. Nothing to reconcile.")
+        return
+
+    console.print(table)
+    if mismatches:
+        console.print(
+            f"[bold red]{mismatches} mismatch(es).[/bold red] The local ledger does not match your "
+            f"live {cfg.exchange} account -- see docs/RISK_DISCLAIMER.md. Use `polybot close` to "
+            "manually align a position, after confirming the correct state on the venue's own site/app."
+        )
+    else:
+        console.print("[bold green]Local ledger matches your live account.[/bold green]")
+
+
+@main.command()
 @click.argument("condition_id")
 @click.pass_context
 def close(ctx: click.Context, condition_id: str) -> None:

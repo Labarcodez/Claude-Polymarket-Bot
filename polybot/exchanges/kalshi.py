@@ -2,11 +2,14 @@
 + RSA-PSS request signing has no dependency-free official Python SDK) wired
 into the common ExchangeAdapter interface.
 
-API reference used to build this (Kalshi's docs site was not reachable from
-this environment while it was written -- verify against
-https://docs.kalshi.com if anything here looks off, especially the order
-response shape, which this project has *not* been validated against a live
-account):
+API reference used to build this. Kalshi's own docs site (docs.kalshi.com)
+was not reachable from the environment this was written in; the request/
+response field names below were instead cross-checked against Kalshi's own
+swagger-generated Python SDK's model docs (github.com/lowgrind/kalshi-python,
+`docs/*.md`) and corroborated across multiple independent write-ups. Still
+verify against https://docs.kalshi.com if anything here looks off, and see
+`polybot inspect-market` / `polybot reconcile` for ways to sanity-check
+against your live account before trusting this with money:
   - Base path: {host}/trade-api/v2
   - Auth: KALSHI-ACCESS-KEY / KALSHI-ACCESS-TIMESTAMP / KALSHI-ACCESS-SIGNATURE
     headers; signature = base64(RSA-PSS-SHA256(timestamp_ms + METHOD + path)),
@@ -14,8 +17,11 @@ account):
     private half.
   - GET /markets, GET /markets/{ticker}, GET /markets/{ticker}/orderbook
   - GET /portfolio/balance -> {"balance": <cents>}
+  - GET /portfolio/positions -> {"market_positions": [{ticker, position, ...}]}
+    where `position` is signed (positive = net YES contracts, negative = net NO).
   - POST /portfolio/orders body: ticker, client_order_id, action (buy/sell),
     side (yes/no), count, type (market/limit), yes_price/no_price (cents).
+    Response: {"order": {..., taker_fill_count, maker_fill_count, status}}.
   - All prices are integer cents (1-99); all sizes are whole contracts
     (unlike Polymarket, Kalshi does not support fractional share sizes).
 """
@@ -33,7 +39,7 @@ import requests
 from ..config import AppConfig
 from ..engine.models import MarketSnapshot, OpenPosition, OrderPlan
 from ..utils.math_utils import clamp
-from .base import ExchangeAdapter, ExecutionResult
+from .base import ExchangeAdapter, ExecutionResult, LivePosition
 
 logger = logging.getLogger(__name__)
 
@@ -288,28 +294,36 @@ class KalshiExchange(ExchangeAdapter):
 
     @staticmethod
     def _reconcile_fill(resp: Any, requested_count: int, requested_price: float) -> ExecutionResult:
-        """Best-effort: figure out how many contracts actually filled from
-        the order-creation response. This project has not been validated
-        against a live Kalshi account, so the exact response field names for
-        fill count are unverified -- if none of the field names we know of
-        are present, we assume a full fill (so the position isn't silently
-        dropped from the local ledger) and log loudly so you can check your
-        actual Kalshi account and correct the ledger with `polybot close` if
-        needed. See docs/RISK_DISCLAIMER.md."""
+        """Figure out how many contracts actually filled from the
+        order-creation response: `POST /portfolio/orders` returns
+        `{"order": Order}`, and `Order.taker_fill_count` /
+        `Order.maker_fill_count` (both contract-unit integers) are the fill
+        counts -- confirmed against Kalshi's own swagger-generated Python
+        SDK model docs (see the module docstring). A resting-then-later-filled
+        order could in principle carry both a taker and a maker fill, so we
+        sum them; for the aggressive crossing limit orders this adapter
+        submits, the fill is almost always 100% taker.
+
+        If a future API response doesn't carry either field (e.g. a schema
+        change this project hasn't caught up with), fall back to assuming
+        the full requested count filled -- so the position isn't silently
+        dropped from the local ledger -- and log loudly so you can check
+        your actual Kalshi account and correct the ledger with
+        `polybot reconcile` / `polybot close` if needed. See
+        docs/RISK_DISCLAIMER.md."""
         order = resp.get("order", resp) if isinstance(resp, dict) else {}
         order_id = order.get("order_id") or order.get("id")
         status = str(order.get("status", "")).lower()
 
-        filled = None
-        for key in ("taker_fill_count", "filled_count", "fill_count", "taker_fills_count", "filled_quantity"):
-            if order.get(key) is not None:
-                filled = order[key]
-                break
-
-        if filled is None:
+        taker = order.get("taker_fill_count")
+        maker = order.get("maker_fill_count")
+        if taker is not None or maker is not None:
+            filled = (taker or 0) + (maker or 0)
+        else:
             logger.warning(
-                "Kalshi order %s: response had no recognizable fill-count field (keys seen: %s) -- "
-                "assuming the full requested count (%d) filled. Verify against your Kalshi account.",
+                "Kalshi order %s: response had neither taker_fill_count nor maker_fill_count "
+                "(keys seen: %s) -- assuming the full requested count (%d) filled. "
+                "Verify against your Kalshi account, e.g. with `polybot reconcile`.",
                 order_id, list(order.keys()), requested_count,
             )
             filled = requested_count
@@ -326,3 +340,31 @@ class KalshiExchange(ExchangeAdapter):
             success=True, filled_shares=float(filled), fill_price=requested_price,
             order_id=order_id, status=status or "filled", raw=resp,
         )
+
+    # ---- reconciliation ---------------------------------------------------
+
+    def get_live_positions(self) -> Optional[List[LivePosition]]:
+        self.require_trading()
+        try:
+            data = self.http.get(f"{API_PREFIX}/portfolio/positions")
+        except Exception:
+            logger.exception("Failed to fetch live Kalshi positions")
+            return None
+
+        positions = []
+        # GetPositionsResponse.market_positions[]; MarketPosition.position is
+        # signed contract count: positive = net YES, negative = net NO.
+        for mp in (data.get("market_positions") or []) if isinstance(data, dict) else []:
+            ticker = mp.get("ticker")
+            net = mp.get("position")
+            if ticker is None or not net:
+                continue
+            positions.append(
+                LivePosition(
+                    condition_id=ticker,
+                    outcome="YES" if net > 0 else "NO",
+                    shares=float(abs(net)),
+                    question=ticker,
+                )
+            )
+        return positions

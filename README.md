@@ -137,6 +137,8 @@ polybot run
 | `polybot scan [--limit N]` | Preview Claude's analysis on current markets; no orders, no DB writes |
 | `polybot run [--once]` | Run the full engine, looping by default |
 | `polybot status` / `polybot positions` | Bankroll, open positions, P&L (for the active exchange) |
+| `polybot decisions [--limit N]` | Review Claude's most recent analyses, traded or not |
+| `polybot reconcile` | Diff the local ledger against the venue's own live positions (requires credentials, places no orders) |
 | `polybot close CONDITION_ID` | Manually close one position now |
 | `polybot approve` | One-time on-chain token allowances (Polymarket EOA wallets only) |
 | `polybot inspect-market REF` | Dump a market's raw API payload -- a slug (Polymarket) or ticker (Kalshi) |

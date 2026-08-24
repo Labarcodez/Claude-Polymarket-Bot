@@ -33,6 +33,19 @@ class ExecutionResult:
     raw: Any = field(default=None, repr=False)
 
 
+@dataclass
+class LivePosition:
+    """One position as the venue itself reports it -- used by `polybot
+    reconcile` to catch drift between the local ledger and reality (e.g. a
+    fill-count reconciliation guess that turned out wrong, a position closed
+    manually outside the bot, a missed webhook/response)."""
+
+    condition_id: str
+    outcome: str  # "YES" or "NO"
+    shares: float
+    question: str = ""
+
+
 class ExchangeAdapter(ABC):
     """One instance = one authenticated (or read-only) session against one venue."""
 
@@ -87,3 +100,13 @@ class ExchangeAdapter(ABC):
         """Submit a real SELL order to close (all of) an existing position.
         `price_hint` is the last observed midpoint, useful as a fallback
         limit reference for venues without a pure market-order type."""
+
+    # ---- reconciliation (optional) ------------------------------------------
+
+    def get_live_positions(self) -> Optional[List[LivePosition]]:
+        """The venue's own record of this account's open positions, for
+        `polybot reconcile` to diff against the local ledger. Requires
+        trading credentials. Returns None if unsupported or on failure --
+        callers should treat that as "couldn't verify", not "confirmed
+        empty". Default: unsupported."""
+        return None

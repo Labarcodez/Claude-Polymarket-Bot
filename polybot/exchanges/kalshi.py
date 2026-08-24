@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
-from ..config import AppConfig
+from ..config import AppConfig, unwrap_secret
 from ..engine.models import MarketSnapshot, OpenPosition, OrderPlan
 from ..utils.math_utils import clamp
 from .base import ExchangeAdapter, ExecutionResult, LivePosition
@@ -187,7 +187,9 @@ class KalshiExchange(ExchangeAdapter):
 
     def __init__(self, config: AppConfig):
         host = config.kalshi.demo_host if config.kalshi.use_demo else config.kalshi.api_host
-        self.http = KalshiHttpClient(host, config.kalshi_api_key_id, config.kalshi_private_key_pem)
+        self.http = KalshiHttpClient(
+            host, unwrap_secret(config.kalshi_api_key_id), unwrap_secret(config.kalshi_private_key_pem)
+        )
         self.status_filter = config.kalshi.status_filter
         if not self.http.can_sign:
             logger.warning(

@@ -190,20 +190,61 @@ class Database:
             )
 
     def open_position(self, plan: OrderPlan, fill_price: float, shares: float, end_date: Optional[str]) -> None:
+        """Insert a new position, or add to an existing *open* one at that
+        condition_id. Deliberately does NOT merge into a previously *closed*
+        row at the same condition_id (SQLite's ON CONFLICT can't easily
+        branch on the existing row's status) -- re-entering a market the
+        bot held and already exited is a brand-new position, not a
+        continuation of the old one, and treating it as a continuation used
+        to silently leave status='closed' on a row that actually held live
+        shares again, hiding it from get_open_positions() (and therefore
+        from ExitManager and RiskManager) entirely."""
         with self._connect() as conn:
-            conn.execute(
-                """INSERT INTO positions
-                   (condition_id, venue, token_id, outcome, question, shares, avg_cost, opened_ts, end_date, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
-                   ON CONFLICT(condition_id) DO UPDATE SET
-                     shares = shares + excluded.shares,
-                     avg_cost = ((shares * avg_cost) + (excluded.shares * excluded.avg_cost)) / (shares + excluded.shares)
-                   """,
-                (
-                    plan.condition_id, plan.venue, plan.token_id, plan.outcome, plan.question,
-                    shares, fill_price, _now_iso(), end_date,
-                ),
-            )
+            existing = conn.execute(
+                "SELECT status, outcome, shares, avg_cost FROM positions WHERE condition_id = ?",
+                (plan.condition_id,),
+            ).fetchone()
+
+            if existing is not None and existing["status"] == "open":
+                if existing["outcome"] != plan.outcome:
+                    # Defense in depth: RiskManager.plan_entry_order already
+                    # refuses a second entry into a market it holds an open
+                    # position in (regardless of side), so this should be
+                    # unreachable in normal operation -- but this table's
+                    # PK is condition_id alone (one row per market, not per
+                    # outcome), so if that upstream guard were ever loosened
+                    # or bypassed, blending a YES fill's shares/avg_cost
+                    # into an open NO row (or vice versa) would silently
+                    # corrupt the position's cost basis with no error. Fail
+                    # loudly instead.
+                    raise ValueError(
+                        f"open_position: condition_id={plan.condition_id} already has an open "
+                        f"{existing['outcome']} position; refusing to blend in a {plan.outcome} fill "
+                        "under the same row (this table holds one outcome per market)."
+                    )
+                new_shares = existing["shares"] + shares
+                new_avg_cost = (existing["shares"] * existing["avg_cost"] + shares * fill_price) / new_shares
+                conn.execute(
+                    "UPDATE positions SET shares = ?, avg_cost = ? WHERE condition_id = ?",
+                    (new_shares, new_avg_cost, plan.condition_id),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO positions
+                       (condition_id, venue, token_id, outcome, question, shares, avg_cost,
+                        opened_ts, end_date, status, closed_ts, close_reason, realized_pnl)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, NULL, 0)
+                       ON CONFLICT(condition_id) DO UPDATE SET
+                         venue = excluded.venue, token_id = excluded.token_id, outcome = excluded.outcome,
+                         question = excluded.question, shares = excluded.shares, avg_cost = excluded.avg_cost,
+                         opened_ts = excluded.opened_ts, end_date = excluded.end_date,
+                         status = 'open', closed_ts = NULL, close_reason = NULL, realized_pnl = 0
+                       """,
+                    (
+                        plan.condition_id, plan.venue, plan.token_id, plan.outcome, plan.question,
+                        shares, fill_price, _now_iso(), end_date,
+                    ),
+                )
         self.increment_today_trade(plan.venue)
 
     def close_position(self, condition_id: str, fill_price: float, reason: str) -> None:
@@ -223,7 +264,12 @@ class Database:
                 (_now_iso(), reason, realized, condition_id),
             )
         self.add_realized_pnl(realized, venue)
-        self.increment_today_trade(venue)
+        # Deliberately does NOT call increment_today_trade() here: trades_count
+        # feeds RiskManager.max_daily_trades, which -- per its own docstring --
+        # gates new *entries* only; exits must stay unmetered by it, or a busy
+        # day of legitimate stop-loss/take-profit exits would burn through the
+        # entry budget and block new entries for the rest of the day for a
+        # reason that has nothing to do with entries at all.
 
     def get_open_positions(self, venue: Optional[str] = None) -> List[OpenPosition]:
         with self._connect() as conn:

@@ -85,7 +85,13 @@ class RiskManager:
             return None
 
         size_usd = self._size_position(price, true_prob, market, portfolio)
-        size_usd = min(size_usd, max(decision.suggested_size_usd, 0.0) or size_usd)
+        # Cap to the model's own suggested size as a sanity bound. A
+        # straight min() -- not "use suggested_size_usd unless it's falsy" --
+        # so a model that actually says 0 (extremely low conviction, even
+        # though it's asked to reserve that for HOLD/NO_TRADE) results in
+        # size 0 and gets rejected below by min_order_usd, rather than
+        # silently discarding that signal and sizing off risk alone.
+        size_usd = min(size_usd, max(decision.suggested_size_usd, 0.0))
 
         if size_usd < self.risk.min_order_usd:
             logger.info(
@@ -128,8 +134,16 @@ class RiskManager:
             price = market.best_ask_yes or market.yes_price
             return "YES", market.yes_token_id, price, decision.fair_value_probability
         else:  # BUY_NO
+            # On a complementary binary market, the cost to BUY NO is the
+            # complement of the YES *bid*, not the YES ask: someone bidding
+            # to buy YES at best_bid_yes is equivalent to someone asking to
+            # sell NO at (1 - best_bid_yes), which is what actually has to
+            # be paid to buy NO right now. (Using best_ask_yes here instead
+            # gives the NO *bid* -- systematically underpricing NO by the
+            # full spread, which both overstates edge and produces a limit
+            # price too low to realistically fill.)
             price = (
-                1 - market.best_ask_yes if market.best_ask_yes is not None else market.no_price
+                1 - market.best_bid_yes if market.best_bid_yes is not None else market.no_price
             )
             return "NO", market.no_token_id, price, 1 - decision.fair_value_probability
 

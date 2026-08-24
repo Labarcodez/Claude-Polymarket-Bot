@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Literal, Optional
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 
 
 class PolymarketConfig(BaseModel):
@@ -90,12 +90,17 @@ class AppConfig(BaseModel):
     risk: RiskConfig = Field(default_factory=RiskConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
-    # --- secrets: populated from the environment only, never from YAML ---
-    private_key: Optional[str] = None          # Polymarket wallet
-    funder_address: Optional[str] = None        # Polymarket proxy/Safe wallet
-    anthropic_api_key: Optional[str] = None
-    kalshi_api_key_id: Optional[str] = None
-    kalshi_private_key_pem: Optional[str] = None
+    # --- secrets: populated from the environment only, never from YAML.
+    # SecretStr so an accidental `print(cfg)`, `logger.debug("%s", cfg)`, or
+    # a traceback/debugger dump of this object renders as
+    # SecretStr('**********') instead of the raw key -- callers that need
+    # the actual value must call .get_secret_value() explicitly, which
+    # makes "this value might get logged" much harder to do by accident. ---
+    private_key: Optional[SecretStr] = None          # Polymarket wallet
+    funder_address: Optional[str] = None               # public address, not secret
+    anthropic_api_key: Optional[SecretStr] = None
+    kalshi_api_key_id: Optional[SecretStr] = None
+    kalshi_private_key_pem: Optional[SecretStr] = None
     confirm_live: bool = False
 
     @property
@@ -125,22 +130,45 @@ def load_config(path: str | Path = "config/default.yaml") -> AppConfig:
 
     cfg = AppConfig(**data)
 
-    cfg.private_key = os.environ.get("POLYMARKET_PRIVATE_KEY") or None
+    cfg.private_key = _secret(os.environ.get("POLYMARKET_PRIVATE_KEY"))
     cfg.funder_address = os.environ.get("POLYMARKET_FUNDER_ADDRESS") or None
-    cfg.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY") or None
-    cfg.kalshi_api_key_id = os.environ.get("KALSHI_API_KEY_ID") or None
-    cfg.kalshi_private_key_pem = _load_kalshi_private_key()
+    cfg.anthropic_api_key = _secret(os.environ.get("ANTHROPIC_API_KEY"))
+    cfg.kalshi_api_key_id = _secret(os.environ.get("KALSHI_API_KEY_ID"))
+    cfg.kalshi_private_key_pem = _secret(_load_kalshi_private_key())
     cfg.confirm_live = os.environ.get("POLYBOT_CONFIRM_LIVE", "").strip().lower() == "yes"
 
+    # Direct attribute assignment on a pydantic model does NOT re-run the
+    # field's Literal validation (that only happens at construction time),
+    # so these two env overrides are validated by hand -- an invalid value
+    # here must raise loudly rather than silently taking effect as a
+    # nonsense string that then does the wrong thing quietly (e.g.
+    # `POLYBOT_MODE=Live` would otherwise leave `cfg.mode` as the raw
+    # string "Live", `is_live` would evaluate False since it's not exactly
+    # "live", and the bot would silently stay in dry_run while `polybot
+    # status` prints the misleading "Mode: Live").
     env_mode = os.environ.get("POLYBOT_MODE")
     if env_mode:
+        if env_mode not in ("dry_run", "live"):
+            raise ValueError(f"POLYBOT_MODE must be 'dry_run' or 'live', got {env_mode!r}")
         cfg.mode = env_mode  # type: ignore[assignment]
 
     env_exchange = os.environ.get("POLYBOT_EXCHANGE")
     if env_exchange:
+        if env_exchange not in ("polymarket", "kalshi"):
+            raise ValueError(f"POLYBOT_EXCHANGE must be 'polymarket' or 'kalshi', got {env_exchange!r}")
         cfg.exchange = env_exchange  # type: ignore[assignment]
 
     return cfg
+
+
+def _secret(value: Optional[str]) -> Optional[SecretStr]:
+    return SecretStr(value) if value else None
+
+
+def unwrap_secret(value: Optional[SecretStr]) -> Optional[str]:
+    """The one place callers should reach for the raw value of a SecretStr
+    config field -- makes every such access grep-able and deliberate."""
+    return value.get_secret_value() if value else None
 
 
 def _load_kalshi_private_key() -> Optional[str]:

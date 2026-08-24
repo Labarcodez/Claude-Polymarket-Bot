@@ -10,6 +10,13 @@ Design notes:
     Polymarket's CLOB. Anything that touches your wallet (balances, orders,
     cancels) raises a clear error via `require_trading()` instead of
     silently doing nothing.
+  - L2 credential derivation (`create_or_derive_api_creds`) is a network
+    round-trip to Polymarket's API, and is deferred until the first call
+    that actually needs it (inside `require_trading()`), rather than done
+    eagerly in `__init__`. A wallet key can be configured (e.g. in
+    preparation for going live later) without every read-only command --
+    `polybot scan`, `polybot status` in dry_run -- taking a hard dependency
+    on Polymarket's auth endpoint being reachable right now.
 """
 from __future__ import annotations
 
@@ -35,6 +42,7 @@ class PolyTradingClient:
 
         self.read_only = private_key is None
         self._host = host
+        self._authenticated = False
 
         if self.read_only:
             self.client = ClobClient(host)
@@ -47,9 +55,10 @@ class PolyTradingClient:
                 signature_type=signature_type,
                 funder=funder_address or None,
             )
-            creds = self.client.create_or_derive_api_creds()
-            self.client.set_api_creds(creds)
-            logger.info("PolyTradingClient authenticated for trading (signature_type=%s).", signature_type)
+            logger.info(
+                "PolyTradingClient configured for trading (signature_type=%s); "
+                "will authenticate lazily on first trading operation.", signature_type,
+            )
 
     # ---- read-only market data (no auth required) -------------------------
 
@@ -83,6 +92,11 @@ class PolyTradingClient:
                 "This operation requires a funded wallet. Set POLYMARKET_PRIVATE_KEY "
                 "(and POLYMARKET_FUNDER_ADDRESS if using a proxy/Safe wallet) in your .env."
             )
+        if not self._authenticated:
+            creds = self.client.create_or_derive_api_creds()
+            self.client.set_api_creds(creds)
+            self._authenticated = True
+            logger.info("PolyTradingClient authenticated for trading.")
 
     def get_usdc_balance(self) -> Optional[float]:
         """Returns available USDC.e collateral balance, in dollars."""

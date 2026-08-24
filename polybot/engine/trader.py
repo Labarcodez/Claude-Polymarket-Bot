@@ -14,7 +14,7 @@ import logging
 from typing import Optional
 
 from ..ai.analyst import ClaudeAnalyst
-from ..config import AppConfig
+from ..config import AppConfig, unwrap_secret
 from ..exchanges import build_exchange
 from ..exchanges.base import ExchangeAdapter, ExecutionResult
 from ..risk.manager import RiskManager
@@ -40,7 +40,7 @@ class TradingEngine:
             )
 
         self.scanner = MarketScanner(self.exchange, config.market_scan)
-        self.analyst = ClaudeAnalyst(config.anthropic_api_key, config.ai)
+        self.analyst = ClaudeAnalyst(unwrap_secret(config.anthropic_api_key), config.ai)
         self.risk_manager = RiskManager(config.risk, config.ai)
         self.exit_manager = ExitManager(
             self.risk_manager, self.db, self.exchange, dry_run=not config.is_live
@@ -136,17 +136,7 @@ class TradingEngine:
 
         open_positions = self.db.get_open_positions(venue=self.config.exchange)
         stats = self.db.get_today_stats(venue=self.config.exchange)
-
-        bankroll = self.config.risk.bankroll_usd
-        if bankroll <= 0:
-            if not self.exchange.read_only and not self.dry_run:
-                live_balance = self.exchange.get_balance_usd()
-                bankroll = live_balance if live_balance is not None else 0.0
-            else:
-                # No configured bankroll and no way to read a live balance
-                # (dry_run / no key): fall back to a nominal paper bankroll
-                # so dry-run sizing logic is still exercisable end-to-end.
-                bankroll = 1000.0
+        bankroll, _note = resolve_bankroll(self.config, self.exchange, self.dry_run)
 
         return PortfolioState(
             bankroll_usd=bankroll,
@@ -154,3 +144,25 @@ class TradingEngine:
             trades_today=stats["trades_count"],
             realized_pnl_today=stats["realized_pnl"],
         )
+
+
+def resolve_bankroll(config: AppConfig, exchange: ExchangeAdapter, dry_run: bool) -> tuple[float, str]:
+    """The single source of truth for "what does this bot consider its
+    bankroll to be", shared by TradingEngine (which risk-sizes against it)
+    and `polybot status` (which displays it) -- kept in one place so the
+    number a user sees in `status` can never silently drift from what the
+    engine is actually sizing positions against.
+
+    Returns (bankroll_usd, human-readable source note).
+    """
+    if config.risk.bankroll_usd > 0:
+        return config.risk.bankroll_usd, "fixed in config"
+
+    if not exchange.read_only and not dry_run:
+        live_balance = exchange.get_balance_usd()
+        return (live_balance if live_balance is not None else 0.0), "live balance"
+
+    # No configured bankroll and no way to read a live balance (dry_run /
+    # no key): fall back to a nominal paper bankroll so dry-run sizing
+    # logic is still exercisable end-to-end.
+    return 1000.0, "nominal paper bankroll -- set risk.bankroll_usd or go live to use a real figure"

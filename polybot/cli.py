@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
-from .config import AppConfig, load_config
+from .config import AppConfig, load_config, unwrap_secret
 from .logging_setup import setup_logging
 
 console = Console()
@@ -107,7 +107,7 @@ def scan(ctx: click.Context, limit: Optional[int]) -> None:
 
     exchange = build_exchange(cfg)
     scanner = MarketScanner(exchange, cfg.market_scan)
-    analyst = ClaudeAnalyst(cfg.anthropic_api_key, cfg.ai)
+    analyst = ClaudeAnalyst(unwrap_secret(cfg.anthropic_api_key), cfg.ai)
 
     try:
         markets = scanner.scan()
@@ -193,23 +193,16 @@ def status(ctx: click.Context) -> None:
     from .exchanges import build_exchange
     from .storage.db import Database
 
+    from .engine.trader import resolve_bankroll
+
     cfg = _load_from_ctx(ctx)
     db = Database(cfg.logging.db_path)
     exchange = build_exchange(cfg)
 
     console.print(f"Exchange: [bold]{cfg.exchange}[/bold]   Mode: [bold]{cfg.mode}[/bold]")
 
-    bankroll_note = ""
-    if cfg.risk.bankroll_usd > 0:
-        bankroll = cfg.risk.bankroll_usd
-        bankroll_note = " (fixed in config)"
-    elif not exchange.read_only and cfg.is_live:
-        bankroll = exchange.get_balance_usd() or 0.0
-        bankroll_note = " (live balance)"
-    else:
-        bankroll = 1000.0
-        bankroll_note = " (nominal paper bankroll -- set risk.bankroll_usd or go live to use a real figure)"
-    console.print(f"Bankroll: ${bankroll:,.2f}{bankroll_note}")
+    bankroll, bankroll_note = resolve_bankroll(cfg, exchange, dry_run=not cfg.is_live)
+    console.print(f"Bankroll: ${bankroll:,.2f} ({bankroll_note})")
 
     stats = db.get_today_stats(venue=cfg.exchange)
     console.print(f"Today: {stats['trades_count']} trade(s), ${stats['realized_pnl']:+,.2f} realized P&L")
@@ -293,16 +286,25 @@ def reconcile(ctx: click.Context) -> None:
         console.print(f"[red]Could not fetch live {cfg.exchange} positions (unsupported, or the request failed -- check the logs above).[/red]")
         raise SystemExit(1)
 
-    local = {p.condition_id: p for p in db.get_open_positions(venue=cfg.exchange)}
-    live_by_id = {lp.condition_id: lp for lp in live}
+    # Key by (condition_id, outcome), not condition_id alone: the local
+    # ledger can only ever hold one outcome per market (RiskManager refuses
+    # a second entry into a market it already has a position in), but a
+    # live account can genuinely hold both legs (a manual trade outside the
+    # bot, a historical position, a partial hedge). Collapsing both legs
+    # onto one condition_id key would silently drop whichever leg lost the
+    # dict collision, and would also let a same-size *wrong-side* position
+    # (local holds YES, live actually holds NO) print as a false "OK".
+    local = {(p.condition_id, p.outcome.upper()): p for p in db.get_open_positions(venue=cfg.exchange)}
+    live_by_id = {(lp.condition_id, lp.outcome.upper()): lp for lp in live}
 
     table = Table(title=f"Reconciliation: local ledger vs. live {cfg.exchange} account")
-    for col in ("Market", "Local shares", "Live shares", "Diff", ""):
+    for col in ("Market", "Outcome", "Local shares", "Live shares", "Diff", ""):
         table.add_column(col)
 
     mismatches = 0
-    for condition_id in sorted(set(local) | set(live_by_id)):
-        lp, rp = local.get(condition_id), live_by_id.get(condition_id)
+    for key in sorted(set(local) | set(live_by_id)):
+        condition_id, outcome = key
+        lp, rp = local.get(key), live_by_id.get(key)
         local_shares = lp.shares if lp else 0.0
         live_shares = rp.shares if rp else 0.0
         diff = live_shares - local_shares
@@ -311,7 +313,7 @@ def reconcile(ctx: click.Context) -> None:
             mismatches += 1
         question = (lp.question if lp else rp.question if rp else condition_id)[:55]
         table.add_row(
-            question, f"{local_shares:.2f}", f"{live_shares:.2f}", f"{diff:+.2f}",
+            question, outcome, f"{local_shares:.2f}", f"{live_shares:.2f}", f"{diff:+.2f}",
             "[green]OK[/green]" if ok else "[bold red]MISMATCH[/bold red]",
         )
 
@@ -352,7 +354,12 @@ def close(ctx: click.Context, condition_id: str) -> None:
     exchange = build_exchange(cfg)
 
     exit_mgr = ExitManager(RiskManager(cfg.risk, cfg.ai), db, exchange, dry_run=not cfg.is_live)
-    price = exit_mgr.get_current_price(pos) or pos.avg_cost
+    fetched_price = exit_mgr.get_current_price(pos)
+    # `or` here would treat a genuinely-zero price (a near-worthless
+    # outcome) the same as a failed fetch and silently report the position
+    # closed at its own cost basis (~$0 P&L) instead of the real near-total
+    # loss -- only fall back to avg_cost when the fetch actually failed (None).
+    price = fetched_price if fetched_price is not None else pos.avg_cost
     exit_mgr.close_position(pos, price, reason="manual_close")
     console.print(f"Closed {pos.question!r} at {price:.4f} (dry_run={not cfg.is_live}).")
 
@@ -380,7 +387,7 @@ def inspect_market(ctx: click.Context, ref: str) -> None:
             from .exchanges.kalshi import API_PREFIX, KalshiHttpClient
 
             host = cfg.kalshi.demo_host if cfg.kalshi.use_demo else cfg.kalshi.api_host
-            http = KalshiHttpClient(host, cfg.kalshi_api_key_id, cfg.kalshi_private_key_pem)
+            http = KalshiHttpClient(host, unwrap_secret(cfg.kalshi_api_key_id), unwrap_secret(cfg.kalshi_private_key_pem))
             data = http.get(f"{API_PREFIX}/markets/{ref}")
             market = data.get("market", data) if isinstance(data, dict) else data
     except requests.exceptions.RequestException as e:
@@ -414,7 +421,7 @@ def approve(ctx: click.Context) -> None:
         "[yellow]This will send on-chain approval transactions on Polygon and requires POL for gas.[/yellow]"
     )
     click.confirm("Continue?", abort=True)
-    run_allowance_setup(cfg.private_key, cfg.polymarket.chain_id)
+    run_allowance_setup(unwrap_secret(cfg.private_key), cfg.polymarket.chain_id)
 
 
 if __name__ == "__main__":

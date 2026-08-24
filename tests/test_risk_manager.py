@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from polybot.engine.models import Action, MarketSnapshot, PortfolioState, TradeDecision
 from polybot.risk.manager import RiskManager
 
@@ -72,6 +74,30 @@ def test_buy_no_uses_no_token_and_inverted_probability(risk_config, ai_config, s
     assert plan is not None
     assert plan.outcome == "NO"
     assert plan.token_id == sample_market.no_token_id
+
+
+def test_buy_no_prices_off_the_yes_bid_not_the_yes_ask(risk_config, ai_config, sample_market):
+    # sample_market: best_bid_yes=0.39, best_ask_yes=0.41. The real cost to
+    # buy NO is 1 - best_bid_yes = 0.61 (the NO *ask*) -- NOT
+    # 1 - best_ask_yes = 0.59 (which is actually the NO *bid*, i.e. what
+    # buying NO would systematically underprice it to).
+    rm = RiskManager(risk_config, ai_config)
+    decision = make_decision(action=Action.BUY_NO, fair_value_probability=0.30, confidence=0.85, suggested_size_usd=200)
+    plan = rm.plan_entry_order(decision, sample_market, make_portfolio())
+    assert plan is not None
+    # 0.61 with a 1% slippage buffer (risk_config.slippage_bps=100), rounded
+    # to the nearest cent tick: 0.61 * 1.01 = 0.6161 -> 0.62.
+    assert plan.limit_price == pytest.approx(0.62)
+    assert plan.limit_price > 0.60  # sanity: must not land at the buggy ~0.59-0.60 range
+
+
+def test_zero_suggested_size_rejects_the_trade_instead_of_falling_back_to_full_risk_size(risk_config, ai_config, sample_market):
+    # A model that returns suggested_size_usd=0 on an actual BUY action is
+    # signaling essentially no conviction. That must result in a rejected
+    # (too-small) trade, not a silent fallback to the full risk-computed size.
+    rm = RiskManager(risk_config, ai_config)
+    decision = make_decision(fair_value_probability=0.65, confidence=0.85, suggested_size_usd=0.0)
+    assert rm.plan_entry_order(decision, sample_market, make_portfolio()) is None
 
 
 def test_position_size_never_exceeds_max_position_usd(risk_config, ai_config, sample_market):

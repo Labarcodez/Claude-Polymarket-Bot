@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from ..clob.client import PolyTradingClient
 from ..clob.data_api import DataApiClient
 from ..clob.gamma import GammaClient
-from ..config import AppConfig
+from ..config import AppConfig, unwrap_secret
 from ..engine.models import MarketSnapshot, OpenPosition, OrderPlan
 from .base import ExchangeAdapter, ExecutionResult, LivePosition
 
@@ -122,7 +122,7 @@ class PolymarketExchange(ExchangeAdapter):
         self.clob = PolyTradingClient(
             host=config.polymarket.clob_host,
             chain_id=config.polymarket.chain_id,
-            private_key=config.private_key,
+            private_key=unwrap_secret(config.private_key),
             funder_address=config.funder_address,
             signature_type=config.polymarket.signature_type,
         )

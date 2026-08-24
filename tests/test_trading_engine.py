@@ -156,13 +156,83 @@ def test_run_cycle_closes_a_position_hitting_take_profit(engine):
     engine.run_cycle()
     [pos] = engine.db.get_open_positions(venue="polymarket")
 
-    # Move the market's midpoint far above cost -- comfortably past the
-    # default take_profit_pct -- and run another cycle; exit review should
-    # close it before any new scan happens.
-    engine.fake_exchange._midpoints[pos.token_id] = pos.avg_cost * 2.0
+    # Move the market's price far above cost -- comfortably past the default
+    # take_profit_pct -- consistently in *both* places a real order book
+    # would move together: the midpoint ExitManager reads, and the
+    # scanner's own snapshot price. (Only bumping the midpoint would leave
+    # the scanner still quoting the old, cheap price on this same cycle's
+    # fresh scan, which -- against a stub analyst that always recommends
+    # the same BUY_YES regardless of price -- would make the bot
+    # immediately buy right back in and defeat the point of this test:
+    # verifying the take-profit exit itself, not cycle-level re-entry
+    # behavior.)
+    new_price = min(pos.avg_cost * 2.0, 0.99)
+    engine.fake_exchange._midpoints[pos.token_id] = new_price
+    market = engine.fake_exchange._markets[0]
+    market.yes_price = new_price
+    market.best_ask_yes = new_price
+    market.best_bid_yes = new_price
 
     engine.run_cycle()
 
     assert engine.db.get_open_positions(venue="polymarket") == []
     stats = engine.db.get_today_stats(venue="polymarket")
     assert stats["realized_pnl"] > 0
+
+
+# ---- resolve_bankroll: single source of truth shared by TradingEngine and `polybot status` ----
+
+
+class _ReadWriteFakeExchange(FakeExchange):
+    """Same as FakeExchange but reports credentials as present, so
+    resolve_bankroll's live-balance branch is reachable in tests."""
+
+    def __init__(self, balance):
+        super().__init__(markets=[])
+        self._balance = balance
+
+    @property
+    def read_only(self) -> bool:
+        return False
+
+    def get_balance_usd(self) -> Optional[float]:
+        return self._balance
+
+
+def test_resolve_bankroll_prefers_fixed_config_value():
+    from polybot.config import AppConfig, RiskConfig
+    from polybot.engine.trader import resolve_bankroll
+
+    cfg = AppConfig(risk=RiskConfig(bankroll_usd=500))
+    bankroll, note = resolve_bankroll(cfg, FakeExchange(markets=[]), dry_run=True)
+    assert bankroll == 500
+    assert "config" in note
+
+
+def test_resolve_bankroll_reads_live_balance_when_live_and_not_read_only():
+    from polybot.config import AppConfig
+    from polybot.engine.trader import resolve_bankroll
+
+    cfg = AppConfig()  # risk.bankroll_usd defaults to 0 -> not fixed
+    bankroll, note = resolve_bankroll(cfg, _ReadWriteFakeExchange(balance=321.50), dry_run=False)
+    assert bankroll == 321.50
+    assert "live" in note.lower()
+
+
+def test_resolve_bankroll_treats_a_failed_live_fetch_as_zero_not_the_nominal_fallback():
+    from polybot.config import AppConfig
+    from polybot.engine.trader import resolve_bankroll
+
+    cfg = AppConfig()
+    bankroll, _note = resolve_bankroll(cfg, _ReadWriteFakeExchange(balance=None), dry_run=False)
+    assert bankroll == 0.0
+
+
+def test_resolve_bankroll_falls_back_to_nominal_paper_bankroll_in_dry_run():
+    from polybot.config import AppConfig
+    from polybot.engine.trader import resolve_bankroll
+
+    cfg = AppConfig()
+    bankroll, note = resolve_bankroll(cfg, FakeExchange(markets=[]), dry_run=True)
+    assert bankroll == 1000.0
+    assert "nominal" in note.lower()

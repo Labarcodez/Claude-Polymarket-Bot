@@ -66,6 +66,24 @@ def test_good_buy_yes_produces_a_sized_plan(risk_config, ai_config, sample_marke
     assert plan.limit_price >= sample_market.best_ask_yes
 
 
+def test_buy_yes_uses_a_genuinely_zero_ask_rather_than_falling_back_to_yes_price(risk_config, ai_config):
+    # `market.best_ask_yes or market.yes_price` would treat a real
+    # best_ask_yes of 0.0 as "missing" and silently substitute yes_price
+    # instead. Construct a market where they'd disagree (0.0 vs 0.05) so a
+    # regression back to `or` is caught: with the real ask (0.0), price<=0
+    # short-circuits to a rejection; with the buggy fallback (0.05), the
+    # trade would instead get priced and possibly accepted.
+    market = MarketSnapshot(
+        condition_id="0xzero", question="Edge case", slug="edge-case",
+        yes_token_id="tok-yes", no_token_id="tok-no",
+        yes_price=0.05, no_price=0.95, best_ask_yes=0.0, best_bid_yes=0.0,
+        volume_24hr=50_000, liquidity=20_000,
+    )
+    rm = RiskManager(risk_config, ai_config)
+    decision = make_decision(fair_value_probability=0.50, confidence=0.90, suggested_size_usd=100)
+    assert rm.plan_entry_order(decision, market, make_portfolio()) is None
+
+
 def test_buy_no_uses_no_token_and_inverted_probability(risk_config, ai_config, sample_market):
     rm = RiskManager(risk_config, ai_config)
     # Model thinks YES is much less likely than market price -> BUY_NO.

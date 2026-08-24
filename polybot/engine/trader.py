@@ -76,7 +76,9 @@ class TradingEngine:
                 logger.exception("[%s] analysis failed, skipping", market.slug)
                 continue
 
-            market_price = market.best_ask_yes or market.yes_price
+            # `is not None`, not `or`: a genuinely-zero best_ask_yes is a
+            # real price, not a missing one.
+            market_price = market.best_ask_yes if market.best_ask_yes is not None else market.yes_price
             plan = self.risk_manager.plan_entry_order(decision, market, portfolio)
             self.db.record_decision(
                 market.condition_id, market.slug, decision, market_price, executed=plan is not None,

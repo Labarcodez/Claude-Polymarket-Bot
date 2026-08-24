@@ -131,7 +131,10 @@ class RiskManager:
     def _resolve_side(decision: TradeDecision, market: MarketSnapshot):
         """Map a BUY_YES/BUY_NO decision to (outcome, token_id, market_price, true_probability)."""
         if decision.action == Action.BUY_YES:
-            price = market.best_ask_yes or market.yes_price
+            # `or` would treat a legitimate (if unusual) best_ask_yes of
+            # exactly 0.0 the same as "missing", silently substituting the
+            # Gamma-quoted yes_price instead of the real (zero) ask.
+            price = market.best_ask_yes if market.best_ask_yes is not None else market.yes_price
             return "YES", market.yes_token_id, price, decision.fair_value_probability
         else:  # BUY_NO
             # On a complementary binary market, the cost to BUY NO is the

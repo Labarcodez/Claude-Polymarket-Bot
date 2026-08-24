@@ -21,6 +21,15 @@ class PolymarketConfig(BaseModel):
     signature_type: int = 0
 
 
+class KalshiConfig(BaseModel):
+    api_host: str = "https://api.elections.kalshi.com"
+    demo_host: str = "https://demo-api.kalshi.co"
+    use_demo: bool = False
+    # Kalshi market status to scan: "open" (tradeable now) is almost always
+    # what you want; see GET /markets in Kalshi's API docs for other values.
+    status_filter: str = "open"
+
+
 class MarketScanConfig(BaseModel):
     max_markets_per_cycle: int = 20
     fetch_pool_size: int = 150
@@ -67,18 +76,26 @@ class LoggingConfig(BaseModel):
 
 class AppConfig(BaseModel):
     mode: Literal["dry_run", "live"] = "dry_run"
+    # Which venue this run trades against. Positions/orders/decisions in the
+    # local DB are tagged by venue, so switching this back and forth is safe
+    # -- the bot only ever looks at (and risk-manages) the active venue's
+    # own open positions.
+    exchange: Literal["polymarket", "kalshi"] = "polymarket"
     polling_interval_seconds: int = 300
 
     polymarket: PolymarketConfig = Field(default_factory=PolymarketConfig)
+    kalshi: KalshiConfig = Field(default_factory=KalshiConfig)
     market_scan: MarketScanConfig = Field(default_factory=MarketScanConfig)
     ai: AIConfig = Field(default_factory=AIConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
 
     # --- secrets: populated from the environment only, never from YAML ---
-    private_key: Optional[str] = None
-    funder_address: Optional[str] = None
+    private_key: Optional[str] = None          # Polymarket wallet
+    funder_address: Optional[str] = None        # Polymarket proxy/Safe wallet
     anthropic_api_key: Optional[str] = None
+    kalshi_api_key_id: Optional[str] = None
+    kalshi_private_key_pem: Optional[str] = None
     confirm_live: bool = False
 
     @property
@@ -87,8 +104,10 @@ class AppConfig(BaseModel):
 
     @property
     def can_trade(self) -> bool:
-        """Whether we have a signer key at all (dry_run still uses it to read
-        balances if present, but doesn't require it)."""
+        """Whether we have credentials for the *active* exchange (dry_run
+        still uses them to read balances if present, but doesn't require them)."""
+        if self.exchange == "kalshi":
+            return bool(self.kalshi_api_key_id and self.kalshi_private_key_pem)
         return bool(self.private_key)
 
 
@@ -109,10 +128,32 @@ def load_config(path: str | Path = "config/default.yaml") -> AppConfig:
     cfg.private_key = os.environ.get("POLYMARKET_PRIVATE_KEY") or None
     cfg.funder_address = os.environ.get("POLYMARKET_FUNDER_ADDRESS") or None
     cfg.anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY") or None
+    cfg.kalshi_api_key_id = os.environ.get("KALSHI_API_KEY_ID") or None
+    cfg.kalshi_private_key_pem = _load_kalshi_private_key()
     cfg.confirm_live = os.environ.get("POLYBOT_CONFIRM_LIVE", "").strip().lower() == "yes"
 
     env_mode = os.environ.get("POLYBOT_MODE")
     if env_mode:
         cfg.mode = env_mode  # type: ignore[assignment]
 
+    env_exchange = os.environ.get("POLYBOT_EXCHANGE")
+    if env_exchange:
+        cfg.exchange = env_exchange  # type: ignore[assignment]
+
     return cfg
+
+
+def _load_kalshi_private_key() -> Optional[str]:
+    """Kalshi's RSA private key can be supplied either inline
+    (KALSHI_PRIVATE_KEY, a PEM string -- handy for a secrets manager /
+    single-line-escaped env value) or as a path to a PEM file
+    (KALSHI_PRIVATE_KEY_PATH, the more common local-dev setup)."""
+    inline = os.environ.get("KALSHI_PRIVATE_KEY")
+    if inline:
+        return inline.replace("\\n", "\n")
+
+    path = os.environ.get("KALSHI_PRIVATE_KEY_PATH")
+    if path and Path(path).exists():
+        return Path(path).read_text()
+
+    return None

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
+
+Venue = Literal["polymarket", "kalshi"]
 
 
 class Action(str, Enum):
@@ -18,8 +20,19 @@ class Action(str, Enum):
 
 class MarketSnapshot(BaseModel):
     """A point-in-time view of one tradeable (binary) market, assembled by
-    the scanner from the Gamma API and (optionally) live CLOB order-book data."""
+    an exchange adapter (see polybot/exchanges/) and shared by every venue.
 
+    Some field names carry over Polymarket's vocabulary for historical
+    reasons but are venue-generic in practice:
+      - `condition_id`: the venue's unique market identifier -- Polymarket's
+        on-chain conditionId, or Kalshi's market ticker.
+      - `yes_token_id` / `no_token_id`: an opaque per-outcome instrument
+        reference the exchange adapter knows how to trade -- Polymarket's
+        CLOB token ids, or (both equal to) the Kalshi ticker, since Kalshi
+        addresses an order by ticker + side rather than distinct per-outcome ids.
+    """
+
+    venue: Venue = "polymarket"
     condition_id: str
     question: str
     slug: str
@@ -61,6 +74,7 @@ class TradeDecision(BaseModel):
 class OrderPlan(BaseModel):
     """A concrete, risk-sized order the executor should place (or simulate)."""
 
+    venue: Venue = "polymarket"
     condition_id: str
     token_id: str
     question: str
@@ -68,13 +82,14 @@ class OrderPlan(BaseModel):
     side: str  # "BUY" or "SELL"
     size_usd: float
     limit_price: float  # slippage-protection price cap, not a resting-order price
-    order_type: str = "FOK"
+    order_type: str = "FOK"  # a hint to the exchange adapter; each venue interprets it in its own terms
     decision_confidence: float
     fair_value_probability: float
     reasoning: str
 
 
 class OpenPosition(BaseModel):
+    venue: Venue = "polymarket"
     condition_id: str
     token_id: str
     outcome: str

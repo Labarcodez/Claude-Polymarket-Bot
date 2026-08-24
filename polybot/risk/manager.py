@@ -97,6 +97,7 @@ class RiskManager:
         limit_price = self._buy_limit_price(price, market.tick_size)
 
         plan = OrderPlan(
+            venue=market.venue,
             condition_id=market.condition_id,
             token_id=token_id,
             question=market.question,
@@ -104,7 +105,10 @@ class RiskManager:
             side="BUY",
             size_usd=round(size_usd, 2),
             limit_price=limit_price,
-            order_type="FOK",
+            # A hint the exchange adapter interprets in its own terms: an
+            # all-or-nothing fill-or-kill order on Polymarket, an aggressive
+            # crossing limit order on Kalshi (which has no FOK order type).
+            order_type="FOK" if market.venue == "polymarket" else "LIMIT",
             decision_confidence=decision.confidence,
             fair_value_probability=decision.fair_value_probability,
             reasoning=decision.reasoning,

@@ -1,6 +1,15 @@
 """Local SQLite ledger: every decision, order, position, and daily stat the
-bot produces, whether paper (dry_run) or real (live). This is the bot's
-memory across restarts and the source of truth for `polybot status`.
+bot produces, whether paper (dry_run) or real (live), tagged by which venue
+(Polymarket or Kalshi) produced it. This is the bot's memory across restarts
+and the source of truth for `polybot status`.
+
+Multi-venue note: `condition_id` collisions across venues are not realistic
+(Polymarket's are 66-char hex conditionIds, Kalshi's are short tickers like
+"KXPRES-24-DJT") so decisions/orders/positions just carry a `venue` column
+without needing a composite key. `daily_stats` is keyed by date alone in
+older databases, which *would* silently merge two venues' stats on the same
+calendar day -- `_migrate` rebuilds that one table onto a (date, venue)
+primary key on first run against an old database.
 """
 from __future__ import annotations
 
@@ -17,6 +26,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
+    venue TEXT NOT NULL DEFAULT 'polymarket',
     condition_id TEXT NOT NULL,
     slug TEXT,
     question TEXT,
@@ -32,6 +42,7 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
+    venue TEXT NOT NULL DEFAULT 'polymarket',
     condition_id TEXT NOT NULL,
     token_id TEXT,
     side TEXT,
@@ -47,6 +58,7 @@ CREATE TABLE IF NOT EXISTS orders (
 
 CREATE TABLE IF NOT EXISTS positions (
     condition_id TEXT PRIMARY KEY,
+    venue TEXT NOT NULL DEFAULT 'polymarket',
     token_id TEXT NOT NULL,
     outcome TEXT NOT NULL,
     question TEXT,
@@ -61,9 +73,11 @@ CREATE TABLE IF NOT EXISTS positions (
 );
 
 CREATE TABLE IF NOT EXISTS daily_stats (
-    date TEXT PRIMARY KEY,
+    date TEXT NOT NULL,
+    venue TEXT NOT NULL DEFAULT 'polymarket',
     trades_count INTEGER DEFAULT 0,
-    realized_pnl REAL DEFAULT 0
+    realized_pnl REAL DEFAULT 0,
+    PRIMARY KEY (date, venue)
 );
 """
 
@@ -81,10 +95,41 @@ class Database:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.db_path = db_path
         self._init_schema()
+        self._migrate()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+
+    def _migrate(self) -> None:
+        """Idempotent, additive migrations for databases created by earlier
+        (single-venue) versions of this project."""
+        with self._connect() as conn:
+            for table in ("decisions", "orders", "positions"):
+                cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if "venue" not in cols:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'")
+
+            stats_cols = {row["name"] for row in conn.execute("PRAGMA table_info(daily_stats)").fetchall()}
+            if "venue" not in stats_cols:
+                # daily_stats was keyed by `date` alone -- rebuild onto a
+                # (date, venue) primary key so two venues on the same
+                # calendar day don't silently share one counter.
+                conn.executescript(
+                    """
+                    ALTER TABLE daily_stats RENAME TO daily_stats_old;
+                    CREATE TABLE daily_stats (
+                        date TEXT NOT NULL,
+                        venue TEXT NOT NULL DEFAULT 'polymarket',
+                        trades_count INTEGER DEFAULT 0,
+                        realized_pnl REAL DEFAULT 0,
+                        PRIMARY KEY (date, venue)
+                    );
+                    INSERT INTO daily_stats (date, venue, trades_count, realized_pnl)
+                        SELECT date, 'polymarket', trades_count, realized_pnl FROM daily_stats_old;
+                    DROP TABLE daily_stats_old;
+                    """
+                )
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -98,15 +143,18 @@ class Database:
 
     # ---- decisions ---------------------------------------------------------
 
-    def record_decision(self, condition_id: str, slug: str, decision: TradeDecision, market_price: float, executed: bool) -> None:
+    def record_decision(
+        self, condition_id: str, slug: str, decision: TradeDecision, market_price: float,
+        executed: bool, venue: str = "polymarket",
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO decisions
-                   (ts, condition_id, slug, question, action, fair_value_probability,
+                   (ts, venue, condition_id, slug, question, action, fair_value_probability,
                     confidence, market_price, reasoning, risk_flags, executed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    _now_iso(), condition_id, slug, None, decision.action.value,
+                    _now_iso(), venue, condition_id, slug, None, decision.action.value,
                     decision.fair_value_probability, decision.confidence, market_price,
                     decision.reasoning, json.dumps(decision.risk_flags), int(executed),
                 ),
@@ -118,11 +166,11 @@ class Database:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO orders
-                   (ts, condition_id, token_id, side, outcome, size_usd, limit_price,
+                   (ts, venue, condition_id, token_id, side, outcome, size_usd, limit_price,
                     order_type, status, order_id, dry_run, raw_response)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    _now_iso(), plan.condition_id, plan.token_id, plan.side, plan.outcome,
+                    _now_iso(), plan.venue, plan.condition_id, plan.token_id, plan.side, plan.outcome,
                     plan.size_usd, plan.limit_price, plan.order_type, status, order_id,
                     int(dry_run), json.dumps(raw_response, default=str) if raw_response else None,
                 ),
@@ -132,28 +180,28 @@ class Database:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO positions
-                   (condition_id, token_id, outcome, question, shares, avg_cost, opened_ts, end_date, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')
+                   (condition_id, venue, token_id, outcome, question, shares, avg_cost, opened_ts, end_date, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
                    ON CONFLICT(condition_id) DO UPDATE SET
                      shares = shares + excluded.shares,
                      avg_cost = ((shares * avg_cost) + (excluded.shares * excluded.avg_cost)) / (shares + excluded.shares)
                    """,
                 (
-                    plan.condition_id, plan.token_id, plan.outcome, plan.question,
+                    plan.condition_id, plan.venue, plan.token_id, plan.outcome, plan.question,
                     shares, fill_price, _now_iso(), end_date,
                 ),
             )
-        self.increment_today_trade()
+        self.increment_today_trade(plan.venue)
 
     def close_position(self, condition_id: str, fill_price: float, reason: str) -> None:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT shares, avg_cost FROM positions WHERE condition_id = ? AND status = 'open'",
+                "SELECT venue, shares, avg_cost FROM positions WHERE condition_id = ? AND status = 'open'",
                 (condition_id,),
             ).fetchone()
             if row is None:
                 return
-            shares, avg_cost = row["shares"], row["avg_cost"]
+            venue, shares, avg_cost = row["venue"], row["shares"], row["avg_cost"]
             realized = (fill_price - avg_cost) * shares
             conn.execute(
                 """UPDATE positions
@@ -161,16 +209,22 @@ class Database:
                    WHERE condition_id=?""",
                 (_now_iso(), reason, realized, condition_id),
             )
-        self.add_realized_pnl(realized)
-        self.increment_today_trade()
+        self.add_realized_pnl(realized, venue)
+        self.increment_today_trade(venue)
 
-    def get_open_positions(self) -> List[OpenPosition]:
+    def get_open_positions(self, venue: Optional[str] = None) -> List[OpenPosition]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM positions WHERE status = 'open'").fetchall()
+            if venue:
+                rows = conn.execute(
+                    "SELECT * FROM positions WHERE status = 'open' AND venue = ?", (venue,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM positions WHERE status = 'open'").fetchall()
         positions = []
         for r in rows:
             positions.append(
                 OpenPosition(
+                    venue=r["venue"],
                     condition_id=r["condition_id"],
                     token_id=r["token_id"],
                     outcome=r["outcome"],
@@ -185,34 +239,42 @@ class Database:
 
     # ---- daily stats ---------------------------------------------------------
 
-    def _ensure_today_row(self, conn: sqlite3.Connection) -> None:
+    def _ensure_today_row(self, conn: sqlite3.Connection, venue: str) -> None:
         conn.execute(
-            "INSERT OR IGNORE INTO daily_stats (date, trades_count, realized_pnl) VALUES (?, 0, 0)",
-            (_today(),),
+            "INSERT OR IGNORE INTO daily_stats (date, venue, trades_count, realized_pnl) VALUES (?, ?, 0, 0)",
+            (_today(), venue),
         )
 
-    def increment_today_trade(self) -> None:
+    def increment_today_trade(self, venue: str = "polymarket") -> None:
         with self._connect() as conn:
-            self._ensure_today_row(conn)
+            self._ensure_today_row(conn, venue)
             conn.execute(
-                "UPDATE daily_stats SET trades_count = trades_count + 1 WHERE date = ?", (_today(),)
+                "UPDATE daily_stats SET trades_count = trades_count + 1 WHERE date = ? AND venue = ?",
+                (_today(), venue),
             )
 
-    def add_realized_pnl(self, amount: float) -> None:
+    def add_realized_pnl(self, amount: float, venue: str = "polymarket") -> None:
         with self._connect() as conn:
-            self._ensure_today_row(conn)
+            self._ensure_today_row(conn, venue)
             conn.execute(
-                "UPDATE daily_stats SET realized_pnl = realized_pnl + ? WHERE date = ?",
-                (amount, _today()),
+                "UPDATE daily_stats SET realized_pnl = realized_pnl + ? WHERE date = ? AND venue = ?",
+                (amount, _today(), venue),
             )
 
-    def get_today_stats(self) -> Dict[str, Any]:
+    def get_today_stats(self, venue: str = "polymarket") -> Dict[str, Any]:
         with self._connect() as conn:
-            self._ensure_today_row(conn)
-            row = conn.execute("SELECT * FROM daily_stats WHERE date = ?", (_today(),)).fetchone()
+            self._ensure_today_row(conn, venue)
+            row = conn.execute(
+                "SELECT * FROM daily_stats WHERE date = ? AND venue = ?", (_today(), venue)
+            ).fetchone()
         return {"trades_count": row["trades_count"], "realized_pnl": row["realized_pnl"]}
 
-    def get_all_time_realized_pnl(self) -> float:
+    def get_all_time_realized_pnl(self, venue: Optional[str] = None) -> float:
         with self._connect() as conn:
-            row = conn.execute("SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM daily_stats").fetchone()
+            if venue:
+                row = conn.execute(
+                    "SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM daily_stats WHERE venue = ?", (venue,)
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT COALESCE(SUM(realized_pnl), 0) AS total FROM daily_stats").fetchone()
         return float(row["total"])

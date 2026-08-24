@@ -21,9 +21,11 @@ console = Console()
 logger = logging.getLogger("polybot.cli")
 
 
-def _load(config_path: str) -> AppConfig:
+def _load(config_path: str, exchange_override: Optional[str] = None) -> AppConfig:
     load_dotenv()
     cfg = load_config(config_path)
+    if exchange_override:
+        cfg.exchange = exchange_override  # type: ignore[assignment]
     setup_logging(cfg.logging.level, cfg.logging.log_path)
     return cfg
 
@@ -37,22 +39,35 @@ def _guard_live(cfg: AppConfig) -> None:
             "docs/RISK_DISCLAIMER.md before enabling it."
         )
         raise SystemExit(1)
-    if cfg.is_live and not cfg.private_key:
-        console.print("[bold red]Refusing to trade live:[/bold red] POLYMARKET_PRIVATE_KEY is not set.")
+    if cfg.is_live and not cfg.can_trade:
+        console.print(
+            f"[bold red]Refusing to trade live:[/bold red] no trading credentials set "
+            f"for exchange={cfg.exchange!r}. See .env.example."
+        )
         raise SystemExit(1)
 
 
 @click.group()
 @click.option("--config", "config_path", default="config/default.yaml", show_default=True, help="Path to config YAML.")
+@click.option(
+    "--exchange", "exchange_override", type=click.Choice(["polymarket", "kalshi"]), default=None,
+    help="Override config.exchange for this invocation.",
+)
 @click.pass_context
-def main(ctx: click.Context, config_path: str) -> None:
-    """Claude-Polymarket-Bot: an AI-analyzed, risk-managed Polymarket trading bot.
+def main(ctx: click.Context, config_path: str, exchange_override: Optional[str]) -> None:
+    """Claude-Polymarket-Bot: an AI-analyzed, risk-managed trading bot for
+    Polymarket and Kalshi prediction markets.
 
     Trading involves real financial risk. Start with `mode: dry_run` (the
     default) and read docs/RISK_DISCLAIMER.md before ever setting mode: live.
     """
     ctx.ensure_object(dict)
     ctx.obj["config_path"] = config_path
+    ctx.obj["exchange_override"] = exchange_override
+
+
+def _load_from_ctx(ctx: click.Context) -> AppConfig:
+    return _load(ctx.obj["config_path"], ctx.obj.get("exchange_override"))
 
 
 @main.command()
@@ -66,8 +81,11 @@ def init() -> None:
     else:
         console.print(".env already exists, leaving it alone.")
     console.print("Next steps:")
-    console.print("  1. Edit .env: set ANTHROPIC_API_KEY (and wallet keys once you're ready to go live).")
-    console.print("  2. Review config/default.yaml.")
+    console.print("  1. Edit .env: set ANTHROPIC_API_KEY (needed either way).")
+    console.print(
+        "  2. Pick a venue in config/default.yaml (`exchange: polymarket` or `kalshi`), "
+        "or pass --exchange on any command."
+    )
     console.print("  3. Run: [bold]polybot scan[/bold] to preview Claude's analysis with no risk.")
 
 
@@ -77,38 +95,31 @@ def init() -> None:
 def scan(ctx: click.Context, limit: Optional[int]) -> None:
     """Preview: scan markets and print Claude's analysis for each. Never
     places or simulates any order, and does not touch the database."""
-    from .ai.analyst import ClaudeAnalyst
-    from .clob.client import PolyTradingClient
-    from .clob.gamma import GammaClient
-    from .engine.scanner import MarketScanner
+    import requests
 
-    cfg = _load(ctx.obj["config_path"])
+    from .ai.analyst import ClaudeAnalyst
+    from .engine.scanner import MarketScanner
+    from .exchanges import build_exchange
+
+    cfg = _load_from_ctx(ctx)
     if limit:
         cfg.market_scan.max_markets_per_cycle = limit
 
-    gamma = GammaClient(cfg.polymarket.gamma_host)
-    clob = None
-    if cfg.private_key:
-        clob = PolyTradingClient(
-            cfg.polymarket.clob_host, cfg.polymarket.chain_id, cfg.private_key,
-            cfg.funder_address, cfg.polymarket.signature_type,
-        )
-    scanner = MarketScanner(gamma, cfg.market_scan, clob)
+    exchange = build_exchange(cfg)
+    scanner = MarketScanner(exchange, cfg.market_scan)
     analyst = ClaudeAnalyst(cfg.anthropic_api_key, cfg.ai)
-
-    import requests
 
     try:
         markets = scanner.scan()
     except requests.exceptions.RequestException as e:
-        console.print(f"[red]Could not reach Polymarket's Gamma API ({cfg.polymarket.gamma_host}): {e}[/red]")
+        console.print(f"[red]Could not reach {cfg.exchange}'s market data API: {e}[/red]")
         raise SystemExit(1)
 
     if not markets:
-        console.print("[yellow]No markets passed the configured filters.[/yellow]")
+        console.print(f"[yellow]No {cfg.exchange} markets passed the configured filters.[/yellow]")
         return
 
-    table = Table(title=f"Claude analysis -- {len(markets)} market(s)")
+    table = Table(title=f"Claude analysis on {cfg.exchange} -- {len(markets)} market(s)")
     for col in ("Market", "Price(Y/N)", "Action", "P(YES)", "Conf.", "Edge", "Reasoning"):
         table.add_column(col, overflow="fold")
 
@@ -139,13 +150,13 @@ def run(ctx: click.Context, once: bool) -> None:
     opportunities, and executes (or simulates, in dry_run mode) trades."""
     from .engine.trader import TradingEngine
 
-    cfg = _load(ctx.obj["config_path"])
+    cfg = _load_from_ctx(ctx)
     _guard_live(cfg)
 
     if cfg.is_live:
-        console.print("[bold red]LIVE TRADING ENABLED.[/bold red] Real orders will be placed with real funds.")
+        console.print(f"[bold red]LIVE TRADING ENABLED on {cfg.exchange}.[/bold red] Real orders will be placed with real funds.")
     else:
-        console.print("[bold cyan]Running in DRY RUN (paper trading) mode.[/bold cyan] No real orders will be placed.")
+        console.print(f"[bold cyan]Running against {cfg.exchange} in DRY RUN (paper trading) mode.[/bold cyan] No real orders will be placed.")
 
     engine = TradingEngine(cfg)
 
@@ -178,36 +189,33 @@ def run(ctx: click.Context, once: bool) -> None:
 @main.command()
 @click.pass_context
 def status(ctx: click.Context) -> None:
-    """Show current mode, bankroll, open positions, and P&L."""
-    from .clob.client import PolyTradingClient
+    """Show current exchange, mode, bankroll, open positions, and P&L."""
+    from .exchanges import build_exchange
     from .storage.db import Database
 
-    cfg = _load(ctx.obj["config_path"])
+    cfg = _load_from_ctx(ctx)
     db = Database(cfg.logging.db_path)
+    exchange = build_exchange(cfg)
 
-    console.print(f"Mode: [bold]{cfg.mode}[/bold]")
+    console.print(f"Exchange: [bold]{cfg.exchange}[/bold]   Mode: [bold]{cfg.mode}[/bold]")
 
     bankroll_note = ""
     if cfg.risk.bankroll_usd > 0:
         bankroll = cfg.risk.bankroll_usd
         bankroll_note = " (fixed in config)"
-    elif cfg.private_key and cfg.is_live:
-        clob = PolyTradingClient(
-            cfg.polymarket.clob_host, cfg.polymarket.chain_id, cfg.private_key,
-            cfg.funder_address, cfg.polymarket.signature_type,
-        )
-        bankroll = clob.get_usdc_balance() or 0.0
-        bankroll_note = " (live USDC balance)"
+    elif not exchange.read_only and cfg.is_live:
+        bankroll = exchange.get_balance_usd() or 0.0
+        bankroll_note = " (live balance)"
     else:
         bankroll = 1000.0
         bankroll_note = " (nominal paper bankroll -- set risk.bankroll_usd or go live to use a real figure)"
     console.print(f"Bankroll: ${bankroll:,.2f}{bankroll_note}")
 
-    stats = db.get_today_stats()
+    stats = db.get_today_stats(venue=cfg.exchange)
     console.print(f"Today: {stats['trades_count']} trade(s), ${stats['realized_pnl']:+,.2f} realized P&L")
-    console.print(f"All-time realized P&L: ${db.get_all_time_realized_pnl():+,.2f}")
+    console.print(f"All-time realized P&L on {cfg.exchange}: ${db.get_all_time_realized_pnl(venue=cfg.exchange):+,.2f}")
 
-    positions = db.get_open_positions()
+    positions = db.get_open_positions(venue=cfg.exchange)
     console.print(f"Open positions: {len(positions)}")
     if positions:
         table = Table()
@@ -230,48 +238,61 @@ def positions(ctx: click.Context) -> None:
 @click.pass_context
 def close(ctx: click.Context, condition_id: str) -> None:
     """Manually close an open position at the current market price."""
-    from .clob.client import PolyTradingClient
-    from .clob.gamma import GammaClient
     from .engine.exit_manager import ExitManager
+    from .exchanges import build_exchange
     from .risk.manager import RiskManager
     from .storage.db import Database
 
-    cfg = _load(ctx.obj["config_path"])
+    cfg = _load_from_ctx(ctx)
     db = Database(cfg.logging.db_path)
-    positions = {p.condition_id: p for p in db.get_open_positions()}
-    pos = positions.get(condition_id)
+    open_positions = {p.condition_id: p for p in db.get_open_positions(venue=cfg.exchange)}
+    pos = open_positions.get(condition_id)
     if pos is None:
-        console.print(f"[red]No open position found for condition_id={condition_id}[/red]")
+        console.print(f"[red]No open {cfg.exchange} position found for condition_id={condition_id}[/red]")
         raise SystemExit(1)
 
     _guard_live(cfg)
-    clob = None
-    if cfg.private_key:
-        clob = PolyTradingClient(
-            cfg.polymarket.clob_host, cfg.polymarket.chain_id, cfg.private_key,
-            cfg.funder_address, cfg.polymarket.signature_type,
-        )
+    exchange = build_exchange(cfg)
 
-    exit_mgr = ExitManager(RiskManager(cfg.risk, cfg.ai), db, clob, dry_run=not cfg.is_live)
-    price = exit_mgr.get_current_price(pos) if clob else pos.avg_cost
+    exit_mgr = ExitManager(RiskManager(cfg.risk, cfg.ai), db, exchange, dry_run=not cfg.is_live)
+    price = exit_mgr.get_current_price(pos) or pos.avg_cost
     exit_mgr.close_position(pos, price, reason="manual_close")
     console.print(f"Closed {pos.question!r} at {price:.4f} (dry_run={not cfg.is_live}).")
 
 
 @main.command(name="inspect-market")
-@click.argument("slug")
+@click.argument("ref")
 @click.pass_context
-def inspect_market(ctx: click.Context, slug: str) -> None:
-    """Dump the raw Gamma API payload for a market slug. Useful for
-    debugging if Polymarket's API schema changes and filtering starts
-    behaving unexpectedly."""
+def inspect_market(ctx: click.Context, ref: str) -> None:
+    """Dump the raw market payload for a slug (Polymarket) or ticker
+    (Kalshi). Useful for debugging if a venue's API schema changes and
+    filtering starts behaving unexpectedly."""
     import json
 
-    from .clob.gamma import GammaClient
+    import requests
 
-    cfg = _load(ctx.obj["config_path"])
-    gamma = GammaClient(cfg.polymarket.gamma_host)
-    market = gamma.get_market_by_slug(slug)
+    cfg = _load_from_ctx(ctx)
+
+    try:
+        if cfg.exchange == "polymarket":
+            from .clob.gamma import GammaClient
+
+            gamma = GammaClient(cfg.polymarket.gamma_host)
+            market = gamma.get_market_by_slug(ref)
+        else:
+            from .exchanges.kalshi import API_PREFIX, KalshiHttpClient
+
+            host = cfg.kalshi.demo_host if cfg.kalshi.use_demo else cfg.kalshi.api_host
+            http = KalshiHttpClient(host, cfg.kalshi_api_key_id, cfg.kalshi_private_key_pem)
+            data = http.get(f"{API_PREFIX}/markets/{ref}")
+            market = data.get("market", data) if isinstance(data, dict) else data
+    except requests.exceptions.RequestException as e:
+        console.print(f"[red]Could not reach {cfg.exchange}'s market data API: {e}[/red]")
+        raise SystemExit(1)
+    except LookupError as e:
+        console.print(f"[red]{e}[/red]")
+        raise SystemExit(1)
+
     console.print_json(json.dumps(market, default=str))
 
 
@@ -280,8 +301,12 @@ def inspect_market(ctx: click.Context, slug: str) -> None:
 def approve(ctx: click.Context) -> None:
     """One-time on-chain approvals so your wallet can trade on Polymarket's
     CTF Exchange (EOA wallets only -- email/Magic and Safe wallets get
-    gasless allowances automatically)."""
-    cfg = _load(ctx.obj["config_path"])
+    gasless allowances automatically). Polymarket-only; Kalshi is a regular
+    brokerage-style account with no on-chain approvals needed."""
+    cfg = _load_from_ctx(ctx)
+    if cfg.exchange != "polymarket":
+        console.print(f"[red]`polybot approve` is Polymarket-only (current exchange: {cfg.exchange}).[/red]")
+        raise SystemExit(1)
     if not cfg.private_key:
         console.print("[red]POLYMARKET_PRIVATE_KEY is not set.[/red]")
         raise SystemExit(1)

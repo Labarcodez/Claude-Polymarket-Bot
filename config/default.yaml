@@ -1,14 +1,23 @@
 # Claude-Polymarket-Bot configuration
 #
-# Secrets (ANTHROPIC_API_KEY, POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER_ADDRESS)
-# live in .env / the environment, never in this file.
+# Secrets (ANTHROPIC_API_KEY, POLYMARKET_PRIVATE_KEY, POLYMARKET_FUNDER_ADDRESS,
+# KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH) live in .env / the environment,
+# never in this file.
 #
 # Every number in here is a starting point, not a recommendation. Trading
 # involves risk of loss. Read docs/RISK_DISCLAIMER.md before changing `mode`
 # to "live".
 
+# Which venue this bot trades against: "polymarket" or "kalshi". Can also be
+# overridden per-invocation with `polybot --exchange kalshi ...` or the
+# POLYBOT_EXCHANGE env var, without editing this file. Positions/orders/
+# decisions in the local database are tagged by venue, so switching this
+# back and forth is safe -- risk limits and exposure are always computed
+# against just the active venue's own open positions.
+exchange: polymarket
+
 # dry_run: paper trading only. Orders are simulated, positions are tracked
-#          in the local database, nothing ever touches your wallet.
+#          in the local database, nothing ever touches your account.
 # live:    real orders, real money. Also requires POLYBOT_CONFIRM_LIVE=yes
 #          in the environment -- see .env.example.
 mode: dry_run
@@ -27,12 +36,23 @@ polymarket:
   # was created. See README "Wallet setup".
   signature_type: 0
 
+kalshi:
+  api_host: "https://api.elections.kalshi.com"
+  demo_host: "https://demo-api.kalshi.co"     # paper-trading sandbox; set use_demo: true to target it
+  use_demo: false
+  status_filter: "open"                        # Kalshi market status to scan -- "open" = currently tradeable
+
 # Which markets are even considered as candidates each cycle.
+#
+# NOTE: min_volume_24hr / min_liquidity are dollar-denominated on Polymarket
+# but *contract-count*-denominated on Kalshi (Kalshi's API reports volume
+# and open interest in contracts, each worth at most $1, not dollars --
+# see polybot/exchanges/kalshi.py). Retune these two when switching exchange.
 market_scan:
   max_markets_per_cycle: 20          # how many candidates get sent to Claude per cycle
-  fetch_pool_size: 150                # how many markets to pull from Gamma before filtering
-  min_volume_24hr: 5000               # USD
-  min_liquidity: 2000                 # USD
+  fetch_pool_size: 150                # how many markets to pull before filtering
+  min_volume_24hr: 5000               # USD (Polymarket) / contracts (Kalshi)
+  min_liquidity: 2000                 # USD (Polymarket) / contracts (Kalshi)
   min_days_to_resolution: 0.25        # skip markets resolving in <6h (execution/settlement risk)
   max_days_to_resolution: 45          # skip markets that won't resolve for a very long time
   min_price: 0.03                     # skip near-zero-probability outcomes (bad risk/reward, thin book)

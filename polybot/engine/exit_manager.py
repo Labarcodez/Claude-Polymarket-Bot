@@ -3,13 +3,16 @@ rule-based exit condition (take profit, stop loss, or approaching
 resolution). Exits are pure risk-management, deliberately not routed back
 through Claude -- there's no reason to pay for a fresh opinion just to
 enforce a stop loss.
+
+Written against the venue-agnostic ExchangeAdapter interface, so the same
+logic closes a Polymarket or a Kalshi position without caring which.
 """
 from __future__ import annotations
 
 import logging
 from typing import Optional
 
-from ..clob.client import PolyTradingClient
+from ..exchanges.base import ExchangeAdapter, ExecutionResult
 from ..risk.manager import RiskManager
 from ..storage.db import Database
 from ..utils.math_utils import days_until
@@ -19,17 +22,17 @@ logger = logging.getLogger(__name__)
 
 
 class ExitManager:
-    def __init__(self, risk_manager: RiskManager, db: Database, clob: Optional[PolyTradingClient], dry_run: bool):
+    def __init__(self, risk_manager: RiskManager, db: Database, exchange: ExchangeAdapter, dry_run: bool):
         self.risk_manager = risk_manager
         self.db = db
-        self.clob = clob
+        self.exchange = exchange
         self.dry_run = dry_run
 
     def review_all(self) -> None:
-        positions = self.db.get_open_positions()
+        positions = self.db.get_open_positions(venue=self.exchange.name)
         if not positions:
             return
-        logger.info("Reviewing %d open position(s) for exits", len(positions))
+        logger.info("Reviewing %d open %s position(s) for exits", len(positions), self.exchange.name)
         for pos in positions:
             self._review_one(pos)
 
@@ -55,23 +58,27 @@ class ExitManager:
         self.close_position(pos, current_price, reason)
 
     def get_current_price(self, pos: OpenPosition) -> Optional[float]:
-        if self.clob is None:
-            return None
         try:
-            return self.clob.get_midpoint(pos.token_id)
+            return self.exchange.get_midpoint(pos.token_id, pos.outcome)
         except Exception:
             logger.exception("Failed to fetch midpoint for %s", pos.token_id)
             return None
 
     def close_position(self, pos: OpenPosition, current_price: float, reason: str) -> None:
-        if not self.dry_run and self.clob is not None:
+        if self.dry_run:
+            result = ExecutionResult(success=True, filled_shares=pos.shares, fill_price=current_price, status="simulated")
+        else:
             try:
-                min_price = max(current_price * 0.95, 0.0)  # allow a little slippage on the way out
-                self.clob.place_market_sell(pos.token_id, pos.shares, min_price=min_price)
+                result = self.exchange.execute_exit(pos, current_price)
             except Exception:
                 logger.exception(
                     "[%s] live SELL order failed -- position left open in DB, will retry next cycle",
                     pos.condition_id,
                 )
                 return
-        self.db.close_position(pos.condition_id, current_price, reason)
+
+        if not result.success:
+            logger.warning("[%s] exit order did not fill: %s", pos.condition_id, result.error or result.status)
+            return
+
+        self.db.close_position(pos.condition_id, result.fill_price, reason)

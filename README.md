@@ -211,14 +211,21 @@ undocumented-in-the-strict-sense and can drift:
   successor `py-sdk`) but still works against the live CLOB API as of this
   writing; if that changes, `polybot/clob/client.py` is the only file that
   needs to change to target a replacement.
-- **Kalshi**: this project was built from Kalshi's documented request/response
-  field names (verified against multiple independent sources) but has **not**
-  been run against a live, funded Kalshi account by its authors -- in
-  particular, the exact shape of an order-creation response (used to
-  reconcile how many contracts actually filled) is unverified. See the
-  loud warning `KalshiExchange._reconcile_fill` logs if it can't recognize
-  the response, and `docs/RISK_DISCLAIMER.md`. Run `polybot inspect-market
-  <ticker>` to check the raw market payload if `polybot scan` looks wrong.
+- **Kalshi**: this project was built from Kalshi's request/response field
+  names triangulated across multiple independent sources (docs.kalshi.com
+  itself was never directly reachable from the environment this was built
+  in) but has **not** been run against a live, funded Kalshi account by its
+  authors. Kalshi's order API moved from a legacy `POST /portfolio/orders`
+  endpoint to a differently-shaped V2 (`POST /portfolio/events/orders`)
+  partway through this project's development -- confirmed by direct
+  evidence that the legacy endpoint now returns HTTP 410 Gone -- and
+  `polybot/exchanges/kalshi.py` was rewritten against the V2 shape. That
+  kind of drift can happen again; see the loud warning
+  `KalshiExchange._reconcile_fill` logs if it can't recognize an
+  order-creation response, and `docs/RISK_DISCLAIMER.md`. Run
+  `polybot inspect-market <ticker>` to check a raw market payload and
+  `polybot reconcile` to check your live positions against the local
+  ledger if anything looks wrong.
 
 ## License
 

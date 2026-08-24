@@ -38,13 +38,20 @@ They do **not** protect you from:
   signing) but has **not** been run against a live, funded account on
   either venue by its authors. Review the code yourself before trusting it
   with money.
-- **Specifically on Kalshi:** the exact response shape of Kalshi's
-  order-creation endpoint (used to figure out how many contracts actually
-  filled) is unverified against a live account -- see
-  `KalshiExchange._reconcile_fill` in `polybot/exchanges/kalshi.py`, which
-  logs loudly and falls back to an optimistic "assume it filled" if the
-  response doesn't look as expected. Check your actual Kalshi position
-  against `polybot status` periodically while live, especially early on.
+- **Specifically on Kalshi:** the request/response shape for placing orders
+  (`polybot/exchanges/kalshi.py`) was triangulated from multiple
+  independent secondary sources, not Kalshi's own docs site directly (not
+  reachable from the environment this was built in) or a live account.
+  Confidence is reasonably high -- one source explicitly quotes "the raw
+  spec" and another documents catching, live, that the *previous*
+  (legacy) order endpoint this project originally targeted now returns
+  HTTP 410 Gone, which is exactly the kind of drift that can happen again.
+  If `execute_entry`/`execute_exit` behave unexpectedly, check
+  `KalshiExchange._reconcile_fill`'s fill-count field name and the request
+  body shape against https://docs.kalshi.com yourself before trusting it
+  further, and run `polybot reconcile` periodically while live, especially
+  early on -- it exists specifically to catch this kind of drift before it
+  costs you money.
 - Anthropic API, Polymarket API, or Kalshi API outages/latency during a
   fast-moving market.
 

@@ -2,14 +2,26 @@
 + RSA-PSS request signing has no dependency-free official Python SDK) wired
 into the common ExchangeAdapter interface.
 
-API reference used to build this. Kalshi's own docs site (docs.kalshi.com)
-was not reachable from the environment this was written in; the request/
-response field names below were instead cross-checked against Kalshi's own
-swagger-generated Python SDK's model docs (github.com/lowgrind/kalshi-python,
-`docs/*.md`) and corroborated across multiple independent write-ups. Still
-verify against https://docs.kalshi.com if anything here looks off, and see
-`polybot inspect-market` / `polybot reconcile` for ways to sanity-check
-against your live account before trusting this with money:
+API reference used to build this. Kalshi's docs site (docs.kalshi.com) has
+never been directly fetchable from the environment this was written in, so
+everything below is triangulated from multiple independent secondary
+sources (search-indexed snippets of docs.kalshi.com itself, several
+third-party integrations, and -- critically -- a wrapper library's GitHub
+issue history that explicitly quotes "the raw spec at
+docs.kalshi.com/api-reference/orders/create-order-v2.md" and documents live
+verification against a real account). It has NOT been exercised against a
+live Kalshi account by this project's authors. Verify against
+https://docs.kalshi.com yourself before trusting it with money, and use
+`polybot inspect-market` / `polybot reconcile` to sanity-check behavior
+against your live account early and often.
+
+IMPORTANT: this project originally targeted the legacy `POST
+/portfolio/orders` endpoint (yes/no side, integer cents, nested under
+"action"+"side"). That endpoint now returns **HTTP 410 Gone** -- confirmed
+by a real integration's issue tracker hitting it live. All order mutation
+now goes through the V2 endpoints below; GET endpoints (markets, balance,
+positions) were unaffected by this migration and remain as before.
+
   - Base path: {host}/trade-api/v2
   - Auth: KALSHI-ACCESS-KEY / KALSHI-ACCESS-TIMESTAMP / KALSHI-ACCESS-SIGNATURE
     headers; signature = base64(RSA-PSS-SHA256(timestamp_ms + METHOD + path)),
@@ -19,11 +31,31 @@ against your live account before trusting this with money:
   - GET /portfolio/balance -> {"balance": <cents>}
   - GET /portfolio/positions -> {"market_positions": [{ticker, position, ...}]}
     where `position` is signed (positive = net YES contracts, negative = net NO).
-  - POST /portfolio/orders body: ticker, client_order_id, action (buy/sell),
-    side (yes/no), count, type (market/limit), yes_price/no_price (cents).
-    Response: {"order": {..., taker_fill_count, maker_fill_count, status}}.
-  - All prices are integer cents (1-99); all sizes are whole contracts
-    (unlike Polymarket, Kalshi does not support fractional share sizes).
+  - POST /portfolio/events/orders (V2, current). Request fields (confirmed
+    against the raw spec per the issue above): ticker, client_order_id,
+    side, count, price, expiration_time, time_in_force, post_only,
+    self_trade_prevention_type, cancel_order_on_pause, reduce_only,
+    subaccount, order_group_id, exchange_index. Unlike the legacy endpoint:
+      * `side` is "bid" (the YES direction) or "ask" (the NO direction) --
+        not "yes"/"no" -- and there is no separate buy/sell `action` field;
+        `reduce_only` (bool) distinguishes closing from opening instead.
+      * `price` is a fixed-point DOLLAR string ("0.6200", not integer
+        cents), and is always expressed as the YES-contract-equivalent
+        price regardless of `side` -- an ask (NO-direction) order priced at
+        "0.17" corresponds to paying $0.83 for NO, not $0.17. See
+        `_yes_equivalent_price()` below for the conversion this adapter
+        does so the rest of the codebase can keep thinking in "price of the
+        outcome I'm actually trading" terms.
+      * `count` is a string, and `time_in_force` + `self_trade_prevention_type`
+        are both required (400 missing_parameters otherwise). This adapter
+        uses time_in_force="fill_or_kill" for the same reason Polymarket
+        orders use FOK: an all-or-nothing fill lets a non-error response
+        be trusted to mean "the requested size actually filled."
+    Response is a thin ack, not a full order object: {order_id,
+    client_order_id?, fill_count, remaining_count, ts_ms,
+    average_fill_price?} (some sources show this nested under an "order"
+    key instead -- _reconcile_fill() below handles both shapes).
+  - DELETE /portfolio/events/orders/{order_id} (V2 cancel).
 """
 from __future__ import annotations
 
@@ -48,6 +80,33 @@ API_PREFIX = "/trade-api/v2"
 
 def _to_cents(price: float) -> int:
     return int(clamp(round(price * 100), 1, 99))
+
+
+def _to_price_string(price: float) -> str:
+    """V2 order prices are fixed-point dollar strings ("0.6200"), not
+    integer cents. Round to the nearest cent first (Kalshi's tick size)
+    the same way _to_cents does, then format at 4 decimal places to match
+    the convention seen in Kalshi's own examples and live-verified logs."""
+    return f"{_to_cents(price) / 100:.4f}"
+
+
+def _yes_equivalent_price(outcome: str, price_in_outcome_terms: float) -> float:
+    """V2's `price` field is always expressed as the YES contract's price,
+    regardless of which book side the order is on. Convert a price already
+    expressed in the position's own outcome terms (price of YES if
+    outcome="YES", price of NO if outcome="NO" -- how the rest of this
+    codebase thinks about prices) into that YES-equivalent representation.
+    Self-inverse: applying it twice returns the original value, which is
+    also how it's used to convert an `average_fill_price` response back
+    into outcome terms."""
+    return price_in_outcome_terms if outcome.upper() == "YES" else 1 - price_in_outcome_terms
+
+
+def _book_side(outcome: str) -> str:
+    """Which V2 book side a transaction *in* `outcome` (buying it, or
+    -- with reduce_only -- closing a position already held in it) sits on.
+    "bid" is the YES direction, "ask" is the NO direction."""
+    return "bid" if outcome.upper() == "YES" else "ask"
 
 
 def parse_market(market: Dict[str, Any]) -> Optional[MarketSnapshot]:
@@ -253,77 +312,95 @@ class KalshiExchange(ExchangeAdapter):
 
     def execute_entry(self, plan: OrderPlan) -> ExecutionResult:
         self.require_trading()
-        side = "yes" if plan.outcome.upper() == "YES" else "no"
         count = max(1, round(plan.size_usd / plan.limit_price))
         body = {
             "ticker": plan.token_id,
             "client_order_id": str(uuid.uuid4()),
-            "action": "buy",
-            "side": side,
-            "count": count,
-            "type": "limit",
-            f"{side}_price": _to_cents(plan.limit_price),
+            "side": _book_side(plan.outcome),
+            "count": str(count),
+            "price": _to_price_string(_yes_equivalent_price(plan.outcome, plan.limit_price)),
+            # FOK for the same reason Polymarket orders use FOK: an
+            # all-or-nothing fill lets a non-error response be trusted to
+            # mean "the requested size actually filled," with no partial-fill
+            # state to reconcile.
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross",
         }
         try:
-            resp = self.http.post(f"{API_PREFIX}/portfolio/orders", body)
+            resp = self.http.post(f"{API_PREFIX}/portfolio/events/orders", body)
         except Exception as e:  # noqa: BLE001
             logger.exception("[%s] Kalshi LIVE buy failed", plan.question)
             return ExecutionResult(success=False, status="error", error=str(e))
-        return self._reconcile_fill(resp, count, plan.limit_price)
+        return self._reconcile_fill(resp, count, plan.limit_price, plan.outcome)
 
     def execute_exit(self, position: OpenPosition, price_hint: float) -> ExecutionResult:
         self.require_trading()
-        side = "yes" if position.outcome.upper() == "YES" else "no"
         count = max(1, round(position.shares))
-        # A floor price a bit below the last observed midpoint, so a limit
-        # sell is likely to cross the book and fill now rather than rest.
+        # A floor price a bit below the last observed midpoint (in the
+        # position's own outcome terms), so an aggressive FOK sell is
+        # likely to cross the book and fill now rather than being killed
+        # unfilled.
         floor_price = clamp(price_hint * 0.95, 0.01, 0.99)
+        # Closing transacts on the OPPOSITE book side from what opened the
+        # position -- a long-YES position is closed via an "ask"
+        # (NO-direction) order, and vice versa -- with reduce_only so it
+        # can't accidentally flip into a fresh position on the other side
+        # if it somehow over-fills. Derived from _book_side() rather than
+        # reimplementing the outcome->side mapping here, so the two can
+        # never silently drift apart if that mapping is ever corrected.
+        opening_side = _book_side(position.outcome)
+        close_side = "ask" if opening_side == "bid" else "bid"
         body = {
             "ticker": position.token_id,
             "client_order_id": str(uuid.uuid4()),
-            "action": "sell",
-            "side": side,
-            "count": count,
-            "type": "limit",
-            f"{side}_price": _to_cents(floor_price),
+            "side": close_side,
+            "count": str(count),
+            "price": _to_price_string(_yes_equivalent_price(position.outcome, floor_price)),
+            "time_in_force": "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross",
+            "reduce_only": True,
         }
         try:
-            resp = self.http.post(f"{API_PREFIX}/portfolio/orders", body)
+            resp = self.http.post(f"{API_PREFIX}/portfolio/events/orders", body)
         except Exception as e:  # noqa: BLE001
             logger.exception("[%s] Kalshi LIVE sell failed", position.question)
             return ExecutionResult(success=False, status="error", error=str(e))
-        return self._reconcile_fill(resp, count, floor_price)
+        return self._reconcile_fill(resp, count, floor_price, position.outcome)
 
     @staticmethod
-    def _reconcile_fill(resp: Any, requested_count: int, requested_price: float) -> ExecutionResult:
+    def _reconcile_fill(resp: Any, requested_count: int, requested_price: float, outcome: str) -> ExecutionResult:
         """Figure out how many contracts actually filled from the
-        order-creation response: `POST /portfolio/orders` returns
-        `{"order": Order}`, and `Order.taker_fill_count` /
-        `Order.maker_fill_count` (both contract-unit integers) are the fill
-        counts -- confirmed against Kalshi's own swagger-generated Python
-        SDK model docs (see the module docstring). A resting-then-later-filled
-        order could in principle carry both a taker and a maker fill, so we
-        sum them; for the aggressive crossing limit orders this adapter
-        submits, the fill is almost always 100% taker.
+        order-creation response. POST /portfolio/events/orders (V2) returns
+        a thin ack -- {order_id, client_order_id?, fill_count,
+        remaining_count, ts_ms, average_fill_price?} -- confirmed against
+        the raw V2 spec (see the module docstring); some sources show this
+        nested under an "order" key instead, so both shapes are handled.
 
-        If a future API response doesn't carry either field (e.g. a schema
-        change this project hasn't caught up with), fall back to assuming
-        the full requested count filled -- so the position isn't silently
-        dropped from the local ledger -- and log loudly so you can check
-        your actual Kalshi account and correct the ledger with
-        `polybot reconcile` / `polybot close` if needed. See
-        docs/RISK_DISCLAIMER.md."""
+        Since every order this adapter submits is time_in_force=
+        "fill_or_kill", there should be no partial-fill state: either
+        fill_count equals the full requested count, or the order was
+        killed entirely. If a future response doesn't carry a recognizable
+        fill-count field at all (e.g. a schema change this project hasn't
+        caught up with), fall back to assuming the full requested count
+        filled -- so the position isn't silently dropped from the local
+        ledger -- and log loudly so you can check your actual Kalshi
+        account and correct the ledger with `polybot reconcile` /
+        `polybot close` if needed. See docs/RISK_DISCLAIMER.md."""
         order = resp.get("order", resp) if isinstance(resp, dict) else {}
         order_id = order.get("order_id") or order.get("id")
         status = str(order.get("status", "")).lower()
 
-        taker = order.get("taker_fill_count")
-        maker = order.get("maker_fill_count")
-        if taker is not None or maker is not None:
-            filled = (taker or 0) + (maker or 0)
-        else:
+        filled = order.get("fill_count")
+        if filled is None:
+            # Defensive fallback for the legacy (pre-410) field names, in
+            # case some response variant ever carries them instead.
+            taker, maker = order.get("taker_fill_count"), order.get("maker_fill_count")
+            if taker is not None or maker is not None:
+                filled = (taker or 0) + (maker or 0)
+
+        if filled is None:
             logger.warning(
-                "Kalshi order %s: response had neither taker_fill_count nor maker_fill_count "
+                "Kalshi order %s: response had no recognizable fill-count field "
                 "(keys seen: %s) -- assuming the full requested count (%d) filled. "
                 "Verify against your Kalshi account, e.g. with `polybot reconcile`.",
                 order_id, list(order.keys()), requested_count,
@@ -331,15 +408,25 @@ class KalshiExchange(ExchangeAdapter):
             filled = requested_count
 
         try:
-            filled = int(filled)
+            filled = int(float(filled))
         except (TypeError, ValueError):
             filled = requested_count
 
         if filled <= 0:
             return ExecutionResult(success=False, status=status or "no_fill", order_id=order_id, raw=resp)
 
+        fill_price = requested_price
+        avg_fill_price = order.get("average_fill_price")
+        if avg_fill_price is not None:
+            try:
+                # average_fill_price is also YES-equivalent; convert back
+                # into the position's own outcome terms for the ledger.
+                fill_price = _yes_equivalent_price(outcome, float(avg_fill_price))
+            except (TypeError, ValueError):
+                pass
+
         return ExecutionResult(
-            success=True, filled_shares=float(filled), fill_price=requested_price,
+            success=True, filled_shares=float(filled), fill_price=fill_price,
             order_id=order_id, status=status or "filled", raw=resp,
         )
 

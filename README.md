@@ -11,7 +11,11 @@ else (scanning, analysis, sizing, exits, the ledger) works the same either way.
 `mode: live`. There is no guarantee this bot makes money — it can lose
 money, including all funds in any account you connect to it. It defaults to
 paper trading (`mode: dry_run`) and stays there until you deliberately flip
-two independent safety switches.**
+two independent safety switches. Published research had frontier LLMs
+(including Claude) trade real money on Kalshi and lose 16–31% over 57
+days — see [docs/RESEARCH_NOTES.md](docs/RESEARCH_NOTES.md) for the full
+picture (where real edge on these platforms does and doesn't exist) before
+deciding how much, if any, real money to risk.**
 
 ## How it works
 
@@ -142,6 +146,7 @@ polybot run
 | `polybot close CONDITION_ID` | Manually close one position now |
 | `polybot approve` | One-time on-chain token allowances (Polymarket EOA wallets only) |
 | `polybot inspect-market REF` | Dump a market's raw API payload -- a slug (Polymarket) or ticker (Kalshi) |
+| `polybot backtest [--demo \| --snapshots ... --resolutions ...] [--strategy null\|random\|claude]` | Replay historical data through the real risk-management code; see [docs/BACKTESTING.md](docs/BACKTESTING.md) |
 
 All commands accept `--config path/to/file.yaml` and `--exchange polymarket|kalshi`.
 
@@ -171,13 +176,37 @@ polybot/
     exit_manager.py                      Rule-based position exits
   storage/
     db.py                                  SQLite ledger, tagged per venue
+  backtest/
+    data.py                                 Historical CSV loading + synthetic demo-data generator
+    engine.py                                Replays history through the real scanner + RiskManager
+    strategies.py                             Pluggable analysis strategies (null/random/claude)
+    metrics.py                                 P&L, drawdown, win rate, Brier score
 scripts/
   setup_allowances.py                       On-chain USDC/CTF allowance setup (Polymarket only)
 tests/                                        pytest suite for the pure logic
 docs/
   ARCHITECTURE.md
   RISK_DISCLAIMER.md
+  BACKTESTING.md
+  RESEARCH_NOTES.md
 ```
+
+## Backtesting
+
+```bash
+polybot backtest --demo --strategy null      # sanity check: must show 0 trades, $0 P&L
+polybot backtest --demo --strategy random    # noise-trader baseline
+polybot backtest --demo --strategy claude    # the real analyst -- costs real API calls
+```
+
+Replays historical market data through the *real* scanner-filter and
+risk-manager code (only the analysis step is swapped) and reports P&L,
+drawdown, win rate, and Brier-score calibration. `--demo` runs against a
+synthetic, calibrated-by-construction dataset that validates the engine's
+mechanics but proves nothing about real profitability; for real data and —
+important if you use `--strategy claude` — a look-ahead-bias trap specific
+to backtesting an LLM against resolved historical markets, read
+[docs/BACKTESTING.md](docs/BACKTESTING.md).
 
 ## Testing
 

@@ -401,6 +401,104 @@ def inspect_market(ctx: click.Context, ref: str) -> None:
 
 
 @main.command()
+@click.option("--snapshots", type=click.Path(exists=True), help="CSV of historical market snapshots. See docs/BACKTESTING.md.")
+@click.option("--resolutions", type=click.Path(exists=True), help="CSV of market resolutions (condition_id, outcome, resolved_ts).")
+@click.option(
+    "--strategy", type=click.Choice(["null", "random", "claude"]), default="random", show_default=True,
+    help="null=sanity check (never trades). random=noise-trader baseline. claude=the real analyst (costs real API calls).",
+)
+@click.option(
+    "--demo", is_flag=True,
+    help="Ignore --snapshots/--resolutions and generate+run a synthetic, calibrated-by-construction demo "
+         "dataset instead. Proves the engine works; proves NOTHING about real profitability.",
+)
+@click.option("--starting-bankroll", default=1000.0, show_default=True, type=float)
+@click.option("--out", type=click.Path(), default=None, help="Write the full JSON report to this path.")
+@click.pass_context
+def backtest(
+    ctx: click.Context, snapshots: Optional[str], resolutions: Optional[str], strategy: str,
+    demo: bool, starting_bankroll: float, out: Optional[str],
+) -> None:
+    """Replay historical market data through the real scanner-filter and
+    risk-manager code (only the analysis step is swapped for the chosen
+    strategy) and report P&L, calibration (Brier score), and drawdown.
+
+    Never touches your real ledger or any exchange -- writes to a fresh
+    temporary database each run. Read docs/BACKTESTING.md before drawing any
+    conclusions from the results, especially with --strategy claude: a
+    resolved historical market is a look-ahead risk specific to LLM
+    strategies that a rule-based backtest doesn't have."""
+    import tempfile
+
+    from .backtest.data import generate_synthetic_dataset, load_resolutions, load_snapshots
+    from .backtest.engine import BacktestEngine
+    from .backtest.metrics import compute_report
+    from .backtest.strategies import ClaudeStrategy, NullStrategy, RandomStrategy
+
+    cfg = _load_from_ctx(ctx)
+    cfg.risk.bankroll_usd = starting_bankroll
+
+    with tempfile.TemporaryDirectory(prefix="polybot-backtest-") as tmpdir:
+        if demo:
+            console.print(
+                "[bold yellow]--demo: generating a SYNTHETIC, calibrated-by-construction dataset.[/bold yellow] "
+                "This validates the engine mechanics only -- it is not real market data and proves nothing "
+                "about real-world profitability. See docs/BACKTESTING.md."
+            )
+            snapshots_path, resolutions_path = generate_synthetic_dataset(
+                f"{tmpdir}/synthetic_snapshots.csv", f"{tmpdir}/synthetic_resolutions.csv",
+            )
+        elif snapshots and resolutions:
+            snapshots_path, resolutions_path = snapshots, resolutions
+        else:
+            console.print("[red]Provide both --snapshots and --resolutions, or pass --demo.[/red]")
+            raise SystemExit(1)
+
+        snapshot_data = load_snapshots(snapshots_path)
+        resolution_data = load_resolutions(resolutions_path)
+        if not snapshot_data:
+            console.print("[red]No snapshot rows loaded -- check the CSV.[/red]")
+            raise SystemExit(1)
+
+        if strategy == "null":
+            strat = NullStrategy()
+        elif strategy == "random":
+            strat = RandomStrategy()
+        else:
+            n_market_evals = sum(len(markets) for _ts, markets in snapshot_data)
+            console.print(
+                f"[yellow]--strategy claude will make up to {n_market_evals} real Claude API calls "
+                f"(one per market per timestamp in the data, before risk filtering) -- this costs real money.[/yellow]"
+            )
+            click.confirm("Continue?", abort=True)
+            from .ai.analyst import ClaudeAnalyst
+
+            strat = ClaudeStrategy(ClaudeAnalyst(unwrap_secret(cfg.anthropic_api_key), cfg.ai))
+
+        console.print(
+            f"Replaying {len(snapshot_data)} timestamp(s), "
+            f"{sum(len(m) for _t, m in snapshot_data)} market-observation(s), "
+            f"{len(resolution_data)} known resolution(s) against `{strat.name}`..."
+        )
+
+        engine = BacktestEngine(cfg, strat, db_path=f"{tmpdir}/backtest.db")
+        engine.run(snapshot_data, resolution_data)
+        # engine.starting_bankroll, not the raw --starting-bankroll value:
+        # they diverge when 0 is passed explicitly (BacktestEngine falls
+        # back to a nominal $1000, mirroring resolve_bankroll()'s own
+        # fallback -- see its docstring), and the report must describe what
+        # the engine actually sized positions against.
+        report = compute_report(engine.db, cfg.exchange, strat.name, engine.starting_bankroll, resolution_data)
+
+    console.print(report.summary())
+    if out:
+        import json
+
+        Path(out).write_text(json.dumps(report.to_dict(), indent=2))
+        console.print(f"Full report written to {out}")
+
+
+@main.command()
 @click.pass_context
 def approve(ctx: click.Context) -> None:
     """One-time on-chain approvals so your wallet can trade on Polymarket's

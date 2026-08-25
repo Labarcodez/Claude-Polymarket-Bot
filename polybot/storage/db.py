@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     market_price REAL,
     reasoning TEXT,
     risk_flags TEXT,
-    executed INTEGER DEFAULT 0
+    executed INTEGER DEFAULT 0,
+    edge_at_execution REAL
 );
 
 CREATE TABLE IF NOT EXISTS orders (
@@ -82,12 +83,18 @@ CREATE TABLE IF NOT EXISTS daily_stats (
 """
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _now_iso(as_of: Optional[datetime] = None) -> str:
+    return (as_of or datetime.now(timezone.utc)).isoformat()
 
 
-def _today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+def _today(as_of: Optional[datetime] = None) -> str:
+    """The calendar date daily_stats buckets against. `as_of` lets the
+    backtest engine (polybot/backtest/) replay historical dates through
+    these same daily-limit-tracking methods instead of always bucketing
+    into the real wall-clock date -- without it, a multi-day backtest would
+    silently collapse every simulated day's trades into a single "today"
+    row, making max_daily_trades/max_daily_loss meaningless in replay."""
+    return (as_of or datetime.now(timezone.utc)).date().isoformat()
 
 
 class Database:
@@ -109,6 +116,10 @@ class Database:
                 cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
                 if "venue" not in cols:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN venue TEXT NOT NULL DEFAULT 'polymarket'")
+
+            decisions_cols = {row["name"] for row in conn.execute("PRAGMA table_info(decisions)").fetchall()}
+            if "edge_at_execution" not in decisions_cols:
+                conn.execute("ALTER TABLE decisions ADD COLUMN edge_at_execution REAL")
 
             stats_cols = {row["name"] for row in conn.execute("PRAGMA table_info(daily_stats)").fetchall()}
             if "venue" not in stats_cols:
@@ -145,37 +156,54 @@ class Database:
 
     def record_decision(
         self, condition_id: str, slug: str, decision: TradeDecision, market_price: float,
-        executed: bool, venue: str = "polymarket", question: str = "",
+        executed: bool, venue: str = "polymarket", question: str = "", as_of: Optional[datetime] = None,
+        edge_at_execution: Optional[float] = None,
     ) -> None:
+        """`edge_at_execution` is the signed (true_prob - price) edge the risk
+        manager actually computed for the traded side (see
+        RiskManager._resolve_side) -- distinct from `market_price`, which is
+        always a YES-ask-anchored implied-P(YES) figure used as the Brier
+        baseline regardless of trade side. Callers that don't know/compute
+        this (e.g. live TradingEngine, which doesn't currently expose it)
+        can omit it; it's only populated by the backtest engine today."""
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO decisions
                    (ts, venue, condition_id, slug, question, action, fair_value_probability,
-                    confidence, market_price, reasoning, risk_flags, executed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    confidence, market_price, reasoning, risk_flags, executed, edge_at_execution)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    _now_iso(), venue, condition_id, slug, question, decision.action.value,
+                    _now_iso(as_of), venue, condition_id, slug, question, decision.action.value,
                     decision.fair_value_probability, decision.confidence, market_price,
                     decision.reasoning, json.dumps(decision.risk_flags), int(executed),
+                    edge_at_execution,
                 ),
             )
 
-    def get_recent_decisions(self, venue: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+    def get_recent_decisions(self, venue: Optional[str] = None, limit: Optional[int] = 20) -> List[Dict[str, Any]]:
         """Most recent decisions first, for `polybot decisions` -- the
         auditable record of what Claude actually said about each market,
-        whether or not the risk manager acted on it."""
+        whether or not the risk manager acted on it. `limit=None` returns
+        every decision (used by polybot/backtest/metrics.py)."""
+        query = "SELECT * FROM decisions"
+        params: tuple = ()
+        if venue:
+            query += " WHERE venue = ?"
+            params = (venue,)
+        query += " ORDER BY id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params = params + (limit,)
         with self._connect() as conn:
-            if venue:
-                rows = conn.execute(
-                    "SELECT * FROM decisions WHERE venue = ? ORDER BY id DESC LIMIT ?", (venue, limit)
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [dict(r) for r in rows]
 
     # ---- orders & positions -------------------------------------------------
 
-    def record_order(self, plan: OrderPlan, status: str, order_id: Optional[str], dry_run: bool, raw_response: Any = None) -> None:
+    def record_order(
+        self, plan: OrderPlan, status: str, order_id: Optional[str], dry_run: bool,
+        raw_response: Any = None, as_of: Optional[datetime] = None,
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO orders
@@ -183,13 +211,16 @@ class Database:
                     order_type, status, order_id, dry_run, raw_response)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    _now_iso(), plan.venue, plan.condition_id, plan.token_id, plan.side, plan.outcome,
+                    _now_iso(as_of), plan.venue, plan.condition_id, plan.token_id, plan.side, plan.outcome,
                     plan.size_usd, plan.limit_price, plan.order_type, status, order_id,
                     int(dry_run), json.dumps(raw_response, default=str) if raw_response else None,
                 ),
             )
 
-    def open_position(self, plan: OrderPlan, fill_price: float, shares: float, end_date: Optional[str]) -> None:
+    def open_position(
+        self, plan: OrderPlan, fill_price: float, shares: float, end_date: Optional[str],
+        as_of: Optional[datetime] = None,
+    ) -> None:
         """Insert a new position, or add to an existing *open* one at that
         condition_id. Deliberately does NOT merge into a previously *closed*
         row at the same condition_id (SQLite's ON CONFLICT can't easily
@@ -242,12 +273,14 @@ class Database:
                        """,
                     (
                         plan.condition_id, plan.venue, plan.token_id, plan.outcome, plan.question,
-                        shares, fill_price, _now_iso(), end_date,
+                        shares, fill_price, _now_iso(as_of), end_date,
                     ),
                 )
-        self.increment_today_trade(plan.venue)
+        self.increment_today_trade(plan.venue, as_of=as_of)
 
-    def close_position(self, condition_id: str, fill_price: float, reason: str) -> None:
+    def close_position(
+        self, condition_id: str, fill_price: float, reason: str, as_of: Optional[datetime] = None,
+    ) -> None:
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT venue, shares, avg_cost FROM positions WHERE condition_id = ? AND status = 'open'",
@@ -261,9 +294,9 @@ class Database:
                 """UPDATE positions
                    SET status='closed', closed_ts=?, close_reason=?, realized_pnl=?
                    WHERE condition_id=?""",
-                (_now_iso(), reason, realized, condition_id),
+                (_now_iso(as_of), reason, realized, condition_id),
             )
-        self.add_realized_pnl(realized, venue)
+        self.add_realized_pnl(realized, venue, as_of=as_of)
         # Deliberately does NOT call increment_today_trade() here: trades_count
         # feeds RiskManager.max_daily_trades, which -- per its own docstring --
         # gates new *entries* only; exits must stay unmetered by it, or a busy
@@ -296,35 +329,51 @@ class Database:
             )
         return positions
 
+    def get_closed_positions(self, venue: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Raw closed-position rows, oldest-closed-first. Unlike
+        get_open_positions this returns dicts, not OpenPosition, since a
+        closed row carries fields (realized_pnl, closed_ts, close_reason)
+        that model doesn't have. Used by polybot/backtest/metrics.py to
+        build an equity curve and win-rate from a backtest run."""
+        query = "SELECT * FROM positions WHERE status = 'closed'"
+        params: tuple = ()
+        if venue:
+            query += " AND venue = ?"
+            params = (venue,)
+        query += " ORDER BY closed_ts"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
     # ---- daily stats ---------------------------------------------------------
 
-    def _ensure_today_row(self, conn: sqlite3.Connection, venue: str) -> None:
+    def _ensure_today_row(self, conn: sqlite3.Connection, venue: str, as_of: Optional[datetime] = None) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO daily_stats (date, venue, trades_count, realized_pnl) VALUES (?, ?, 0, 0)",
-            (_today(), venue),
+            (_today(as_of), venue),
         )
 
-    def increment_today_trade(self, venue: str = "polymarket") -> None:
+    def increment_today_trade(self, venue: str = "polymarket", as_of: Optional[datetime] = None) -> None:
         with self._connect() as conn:
-            self._ensure_today_row(conn, venue)
+            self._ensure_today_row(conn, venue, as_of)
             conn.execute(
                 "UPDATE daily_stats SET trades_count = trades_count + 1 WHERE date = ? AND venue = ?",
-                (_today(), venue),
+                (_today(as_of), venue),
             )
 
-    def add_realized_pnl(self, amount: float, venue: str = "polymarket") -> None:
+    def add_realized_pnl(self, amount: float, venue: str = "polymarket", as_of: Optional[datetime] = None) -> None:
         with self._connect() as conn:
-            self._ensure_today_row(conn, venue)
+            self._ensure_today_row(conn, venue, as_of)
             conn.execute(
                 "UPDATE daily_stats SET realized_pnl = realized_pnl + ? WHERE date = ? AND venue = ?",
-                (amount, _today(), venue),
+                (amount, _today(as_of), venue),
             )
 
-    def get_today_stats(self, venue: str = "polymarket") -> Dict[str, Any]:
+    def get_today_stats(self, venue: str = "polymarket", as_of: Optional[datetime] = None) -> Dict[str, Any]:
         with self._connect() as conn:
-            self._ensure_today_row(conn, venue)
+            self._ensure_today_row(conn, venue, as_of)
             row = conn.execute(
-                "SELECT * FROM daily_stats WHERE date = ? AND venue = ?", (_today(), venue)
+                "SELECT * FROM daily_stats WHERE date = ? AND venue = ?", (_today(as_of), venue)
             ).fetchone()
         return {"trades_count": row["trades_count"], "realized_pnl": row["realized_pnl"]}
 

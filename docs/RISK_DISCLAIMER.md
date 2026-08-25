@@ -18,6 +18,28 @@ wallet or account you connect to it.** Only connect a wallet/account funded
 with money you can afford to lose completely, and never your primary wallet
 or one holding unrelated funds/permissions.
 
+## What the actual evidence says
+
+This isn't a hypothetical caveat. Published research
+([full sourcing in docs/RESEARCH_NOTES.md](RESEARCH_NOTES.md)) had six
+frontier LLMs -- including Claude -- trade $10,000 of real capital
+autonomously on Kalshi for 57 days. **Every single model lost money**,
+between -16% and -31%. The same run on Polymarket lost less on average
+(-1.1%), still net negative. Separately, calibration research found LLMs
+are systematically *overconfident* on these platforms, not merely noisy --
+stated 90-100% confidence was backed by real accuracy as low as 31-70%
+across models tested, and giving the model more room to reason did not fix
+this and sometimes made it worse. This project's system prompt
+(`polybot/ai/prompts.py`) is written with that evidence in mind -- biased
+hard toward `NO_TRADE`, explicit about overconfidence as the default
+failure mode -- but a system prompt is not a guarantee, and the honest
+base-rate expectation for an automated strategy like this one, per that
+same research, is **roughly break-even to a real loss after costs**, not
+consistent profit. If you want the full picture -- including where genuine,
+evidenced edge on these platforms does exist, and why it's mostly not
+retail-accessible -- read `docs/RESEARCH_NOTES.md` in full before deciding
+how much (if any) real money to risk here.
+
 ## What the risk layer does and does not protect you from
 
 `polybot/risk/manager.py` enforces hard limits: per-trade size caps, per-market
